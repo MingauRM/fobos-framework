@@ -1,0 +1,19 @@
+cmake_minimum_required(VERSION 3.16)
+project(FobosFramework)
+
+set(CMAKE_CXX_STANDARD 20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib_archive)
+
+set(LUAU_SOURCE ${CMAKE_SOURCE_DIR}/extern/luau)
+option(LUAU_BUILD_CLI "Build CLI" OFF)
+option(LUAU_BUILD_TESTS "Build tests" OFF)
+
+set(SOURCES ${CMAKE_SOURCE_DIR}/src)
+set(INCLUDES ${CMAKE_SOURCE_DIR}/include)
+
+add_subdirectory(${LUAU_SOURCE})
+add_subdirectory(${SOURCES})
