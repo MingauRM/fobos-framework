@@ -499,7 +499,8 @@ int luaopen_base(lua_State* L)
 
     // open lib into global table
     luaL_register(L, "_G", base_funcs);
-    lua_pushliteral(L, "Luau");
+
+    lua_pushliteral(L, "Fobos 1.0.0");
     lua_setglobal(L, "_VERSION"); // set global _VERSION
 
     // `ipairs' and `pairs' need auxiliary functions as upvalues

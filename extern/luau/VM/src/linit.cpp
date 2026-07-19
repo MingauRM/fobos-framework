@@ -10,6 +10,8 @@ LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
 
 static const luaL_Reg lualibs[] = {
     {"", luaopen_base},
+    {LUA_RUNTIMEDATANAME, luaopen_RUNTIME},
+    {LUAU_VERSIONNAME, luaopen_LUAU},
     {LUA_COLIBNAME, luaopen_coroutine},
     {LUA_TABLIBNAME, luaopen_table},
     {LUA_OSLIBNAME, luaopen_os},
@@ -26,6 +28,8 @@ static const luaL_Reg lualibs[] = {
 
 static const luaL_Reg lualibs_NOINTEGER[] = {
     {"", luaopen_base},
+    {LUA_RUNTIMEDATANAME, luaopen_RUNTIME},
+    {LUAU_VERSIONNAME, luaopen_LUAU},
     {LUA_COLIBNAME, luaopen_coroutine},
     {LUA_TABLIBNAME, luaopen_table},
     {LUA_OSLIBNAME, luaopen_os},

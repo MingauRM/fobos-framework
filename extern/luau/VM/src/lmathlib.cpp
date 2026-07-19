@@ -489,6 +489,22 @@ static int math_smoothstep(lua_State* L)
     return 1;
 }
 
+static int math_trunc(lua_State* L)
+{
+    double x = luaL_checknumber(L, 1);
+    lua_pushnumber(L, trunc(x));
+
+    return 1;
+}
+
+static int math_frac(lua_State* L)
+{
+    double x = luaL_checknumber(L, 1);
+    lua_pushnumber(L, x - trunc(x));
+
+    return 1;
+}
+
 static const luaL_Reg mathlib[] = {
     {"abs", math_abs},
     {"acos", math_acos},
@@ -528,6 +544,8 @@ static const luaL_Reg mathlib[] = {
     {"isinf", math_isinf},
     {"isfinite", math_isfinite},
     {"smoothstep", math_smoothstep},
+    {"frac", math_frac},
+    {"trunc", math_trunc},
     {NULL, NULL},
 };
 

@@ -12,4 +12,10 @@ target_link_libraries(FobosFramework PRIVATE
 )
 
 set_target_properties(FobosFramework PROPERTIES OUTPUT_NAME fobos)
-target_sources(FobosFramework PRIVATE main.cpp)
+target_sources(FobosFramework PRIVATE
+    main.cpp
+    mod/_RUNTIME.cpp
+    mod/_LUAU.cpp
+    # mod/lsignallib.cpp
+    # mod/ltasklib.cpp
+)

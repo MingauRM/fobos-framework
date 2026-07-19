@@ -154,6 +154,12 @@ LUALIB_API int luaopen_vector(lua_State* L);
 #define LUA_INTLIBNAME "integer"
 LUALIB_API int luaopen_integer(lua_State* L);
 
+#define LUA_RUNTIMEDATANAME "_RUNTIME"
+LUALIB_API int luaopen_RUNTIME(lua_State* L);
+
+#define LUAU_VERSIONNAME "_LUAU"
+LUALIB_API int luaopen_LUAU(lua_State* L);
+
 // open all builtin libraries
 LUALIB_API void luaL_openlibs(lua_State* L);
 

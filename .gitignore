@@ -1,4 +1,5 @@
 build/
 .vscode/
+.defs/
 tests/
 stylua.toml
