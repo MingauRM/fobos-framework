@@ -154,6 +154,9 @@ LUALIB_API int luaopen_vector(lua_State* L);
 #define LUA_INTLIBNAME "integer"
 LUALIB_API int luaopen_integer(lua_State* L);
 
+#define LUA_SIGNALLIBNAME "signal"
+LUALIB_API int luaopen_signal(lua_State* L);
+
 #define LUA_RUNTIMEDATANAME "_RUNTIME"
 LUALIB_API int luaopen_RUNTIME(lua_State* L);
 
