@@ -53,6 +53,14 @@ static int signal_destroy(lua_State* L)
     auto it = std::find(SignalRegistry.begin(), SignalRegistry.end(), signal);
     SignalRegistry.erase(it);
 
+    std::vector<ScriptConnection> connections = signal->GetConnections();
+
+    for (size_t i = 0; i < connections.size(); i++)
+    {
+        lua_unref(L, (connections[i].GetCallback()));
+        signal->Disconnect(connections[i]);
+    }
+
     signal->~ScriptSignal();
 
     return 0;
