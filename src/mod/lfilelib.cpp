@@ -226,6 +226,11 @@ static int file_getchildren(lua_State* L)
     for (const auto& entry : std::filesystem::directory_iterator(path))
     {
         const char* entryPath = entry.path().generic_string().c_str();
+        if (std::filesystem::is_directory(entryPath))
+        {
+            entryPath = (std::string(entryPath) + std::string("/")).c_str();
+        }
+        
         lua_pushstring(L, entryPath);
         lua_rawseti(L, -2, key++);
     }
@@ -260,6 +265,11 @@ static int file_getdescendants(lua_State* L)
     for (const auto& entry : std::filesystem::recursive_directory_iterator(path))
     {
         const char* entryPath = entry.path().generic_string().c_str();
+        if (std::filesystem::is_directory(entryPath))
+        {
+            entryPath = (std::string(entryPath) + std::string("/")).c_str();
+        }
+
         lua_pushstring(L, entryPath);
         lua_rawseti(L, -2, key++);
     }
