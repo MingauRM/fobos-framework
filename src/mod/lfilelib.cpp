@@ -6,10 +6,8 @@
 #include <fstream>
 #include <ios>
 
-#include <iostream>
-
-constexpr std::string MODE_BINARY = "binary";
-constexpr std::string MODE_TEXT = "text";
+constexpr char* MODE_BINARY = "binary";
+constexpr char* MODE_TEXT = "text";
 
 // Library functions
 
@@ -84,7 +82,7 @@ static int file_read(lua_State* L)
         return 0;
     }
 
-    std::string mode = luaL_optstring(L, 2, MODE_TEXT.c_str());
+    std::string mode = luaL_optstring(L, 2, MODE_TEXT);
 
     std::ios::openmode openMode = std::ios::in;
     bool modeValid = false;
@@ -143,7 +141,7 @@ static int file_write(lua_State* L)
 
     std::string data = luaL_checkstring(L, 2);
     int position = luaL_checkinteger(L, 3);
-    std::string mode = luaL_optstring(L, 4, MODE_TEXT.c_str());
+    std::string mode = luaL_optstring(L, 4, MODE_TEXT);
 
     std::ios::openmode openMode = std::ios::out;
     bool modeValid = false;
@@ -274,10 +272,10 @@ static int file_getdescendants(lua_State* L)
 static const luaL_Reg filelib[] = {
     {"create", file_create},
     {"exists", file_exists},
-    {"read", file_read},
-    {"write", file_write},
     {"isfile", file_isfile},
     {"isfolder", file_isfolder},
+    {"read", file_read},
+    {"write", file_write},
     {"getchildren", file_getchildren},
     {"getdescendants", file_getdescendants},
     {NULL, NULL}
@@ -289,10 +287,10 @@ int luaopen_file(lua_State* L)
 
     lua_newtable(L);
 
-    lua_pushstring(L, MODE_BINARY.c_str());
+    lua_pushstring(L, MODE_BINARY);
     lua_setfield(L, -2, "binary");
 
-    lua_pushstring(L, MODE_TEXT.c_str());
+    lua_pushstring(L, MODE_TEXT);
     lua_setfield(L, -2, "text");
 
     lua_setfield(L, -2, "filemode");
