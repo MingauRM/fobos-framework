@@ -6,6 +6,8 @@
 #include <fstream>
 #include <ios>
 
+#include <iostream>
+
 constexpr std::string MODE_BINARY = "binary";
 constexpr std::string MODE_TEXT = "text";
 
@@ -221,18 +223,14 @@ static int file_getchildren(lua_State* L)
     }
 
     lua_newtable(L);
-    size_t key = 0;
+    size_t key = 1;
 
     for (const auto& entry : std::filesystem::directory_iterator(path))
     {
-        const char* entryPath = entry.path().generic_string().c_str();
-        if (std::filesystem::is_directory(entryPath))
-        {
-            entryPath = (std::string(entryPath) + std::string("/")).c_str();
-        }
-        
-        lua_pushstring(L, entryPath);
-        lua_rawseti(L, -2, key++);
+        std::string entryPath = entry.path().generic_string();
+        lua_pushstring(L, entryPath.c_str());
+        lua_rawseti(L, -2, key);
+        key++;
     }
 
     return 1;
@@ -260,18 +258,14 @@ static int file_getdescendants(lua_State* L)
     }
 
     lua_newtable(L);
-    size_t key = 0;
+    size_t key = 1;
 
     for (const auto& entry : std::filesystem::recursive_directory_iterator(path))
     {
-        const char* entryPath = entry.path().generic_string().c_str();
-        if (std::filesystem::is_directory(entryPath))
-        {
-            entryPath = (std::string(entryPath) + std::string("/")).c_str();
-        }
-
-        lua_pushstring(L, entryPath);
-        lua_rawseti(L, -2, key++);
+        std::string entryPath = entry.path().generic_string();
+        lua_pushstring(L, entryPath.c_str());
+        lua_rawseti(L, -2, key);
+        key++;
     }
 
     return 1;
