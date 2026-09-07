@@ -10,7 +10,7 @@
 
 static int audio_load(lua_State* L)
 {
-    const char* path = luaL_checkstring(L, 1);
+    const char* data = luaL_checkstring(L, 1);
 
 
 }

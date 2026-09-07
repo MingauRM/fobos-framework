@@ -17,6 +17,7 @@ target_sources(FobosFramework PRIVATE
     mod/_RUNTIME.cpp
     mod/_LUAU.cpp
     mod/signal/lsignallib.cpp
+    mod/file/lfilelib.cpp
     # mod/ltasklib.cpp
     # mod/audio/laudiolib.cpp
 )
