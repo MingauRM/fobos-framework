@@ -12,19 +12,30 @@
 #include "lualib.h"
 #include "luaconf.h"
 #include "luacode.h"
+#include "Luau/Compiler.h"
+
+#include "custom_types.hpp"
 
 inline std::filesystem::path GAME_ROOT;
 
-enum class TaskType
+enum class TaskPriority
 {
     Default,
     Deferred
 };
 
+enum class TaskConcurrency
+{
+    Serial,
+    Parallel
+};
+
 struct Task
 {
     lua_State* thread;
-    TaskType type;
+    std::chrono::steady_clock::time_point time;
+    TaskPriority priority;
+    TaskConcurrency concurrency;
 };
 
 class Engine
@@ -43,15 +54,15 @@ class Engine
 
         void UpdateScheduler()
         {
-
-        }
-
-        void ScheduleTask(Task task, std::chrono::duration<double> waitTime)
-        {
             
         }
 
-        std::string CompileScript(const std::string& scriptPath) const
+        void ScheduleTask(Task* task)
+        {
+            TaskScheduler.push_back(task);
+        }
+
+        std::string CompileScript(const std::string& scriptPath, Luau::CompileOptions options) const
         {
             std::ifstream file(scriptPath, std::ios::in | std::ios::binary);
             if (!file)
@@ -66,19 +77,15 @@ class Engine
             );
             file.close();
 
-            size_t bytecodeSize = 0;
-            char* bytecode = luau_compile(script.c_str(), script.length(), nullptr, &bytecodeSize);
+            std::string bytecode = Luau::compile(script, options);
 
-            if (!bytecode) {
+            if (bytecode.empty()) {
                 std::cerr << "Failed to compile script" << scriptPath << "\n";
                 std::cerr << "Error: " << bytecode << "\n";
                 return "";
             }
 
-            std::string bytecodeString = std::string(bytecode, bytecodeSize);
-            free(bytecode);
-
-            return bytecodeString;
+            return bytecode;
         }
 
         int ExecuteBytecode(const std::string& chunkName, const std::string& bytecode) const
@@ -124,9 +131,8 @@ class Engine
             luaL_openlibs(L);
             luaL_sandbox(L);
         }
-
         ~Engine() = default;
 
-        std::vector<lua_State*> TaskScheduler;
+        std::vector<Task*> TaskScheduler;
         lua_State* L;
 };

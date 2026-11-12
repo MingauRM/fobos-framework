@@ -1,0 +1,9 @@
+{
+    "stylua.targetReleaseVersion": "latest",
+    "luau-lsp.types.definitionFiles": {
+        "_RUNTIME": "luau-lsp/definitions/_RUNTIME.d.luau",
+        "_LUAU": "luau-lsp/definitions/_LUAU.d.luau",
+        "math": "luau-lsp/definitions/math.d.luau"
+    },
+    "luau-lsp.types.documentationFiles": []
+}

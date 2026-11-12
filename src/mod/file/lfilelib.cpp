@@ -166,7 +166,7 @@ static int file_write(lua_State* L)
     std::filesystem::path path = *lua_checkpath(L, 1);
     if (!is_path_safe(path))
     {
-                luaL_error(L, ("Attempt to access file/directory without permission. (Must be descendant of " + GAME_ROOT.generic_string() + ").\n").c_str());
+        luaL_error(L, ("Attempt to access file/directory without permission. (Must be descendant of " + GAME_ROOT.generic_string() + ").\n").c_str());
         lua_pop(L, 1);
         return 0;
     }
@@ -348,12 +348,26 @@ static const luaL_Reg filelib[] = {
 
 int luaopen_file(lua_State* L)
 {
+    luaL_newmetatable(L, "pathMetatable");
+    int metatable = lua_gettop(L);
+    
+    lua_pushstring(L, FILEPATH_TYPENAME);
+    lua_setfield(L, metatable, "__type");
+
+    lua_pushcfunction(L, path_index, "path_index");
+    lua_setfield(L, metatable, "__index");
+    lua_pushcfunction(L, path_tostring, "path_tostring");
+    lua_setfield(L, metatable, "__tostring");
+    lua_pushcfunction(L, path_add, "path_add");
+    lua_setfield(L, metatable, "__add");
+
+    lua_setuserdatametatable(L, (int)CustomLuauTypeTags::FILEPATH_TYPE);
+
     lua_newtable(L);
     int openmodeTable = lua_gettop(L);
 
     lua_pushlstring(L, OPENMODE_BINARY, sizeof(OPENMODE_BINARY));
     lua_setfield(L, openmodeTable, "binary");
-
     lua_pushlstring(L, OPENMODE_TEXT, sizeof(OPENMODE_TEXT));
     lua_setfield(L, openmodeTable, "text");
 
