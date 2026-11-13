@@ -7,6 +7,9 @@
 
 #include <optional>
 
+LUAU_FASTFLAG(LuauCodegenUpdateSafeEnvList)
+LUAU_FASTFLAG(LuauCodegenCmpAnySideEffecting)
+
 namespace Luau
 {
 namespace CodeGen
@@ -32,6 +35,7 @@ inline bool isBlockTerminator(IrCmd cmd)
     case IrCmd::JUMP_IF_FALSY:
     case IrCmd::JUMP_EQ_TAG:
     case IrCmd::JUMP_CMP_INT:
+    case IrCmd::JUMP_CMP_INT64:
     case IrCmd::JUMP_EQ_POINTER:
     case IrCmd::JUMP_CMP_NUM:
     case IrCmd::JUMP_CMP_FLOAT:
@@ -63,6 +67,7 @@ inline bool isNonTerminatingJump(IrCmd cmd)
     case IrCmd::CHECK_READONLY:
     case IrCmd::CHECK_NO_METATABLE:
     case IrCmd::CHECK_SAFE_ENV:
+    case IrCmd::CHECK_YIELDABLE:
     case IrCmd::CHECK_ARRAY_SIZE:
     case IrCmd::CHECK_SLOT_MATCH:
     case IrCmd::CHECK_NODE_NO_NEXT:
@@ -105,6 +110,8 @@ inline bool canInvalidateSafeEnv(IrCmd cmd)
     case IrCmd::FALLBACK_NAMECALL:
     case IrCmd::FALLBACK_FORGPREP:
         return true;
+    case IrCmd::INVOKE_FASTPCALL:
+        return FFlag::LuauCodegenUpdateSafeEnvList;
     default:
         break;
     }
@@ -121,6 +128,9 @@ inline bool isPseudo(IrCmd cmd)
 inline bool hasSideEffects(IrCmd cmd)
 {
     if (cmd == IrCmd::INVOKE_FASTCALL)
+        return true;
+
+    if (FFlag::LuauCodegenCmpAnySideEffecting && cmd == IrCmd::CMP_ANY)
         return true;
 
     if (isPseudo(cmd))
@@ -205,6 +215,12 @@ bool isCustomUserdataBytecodeType(uint8_t ty);
 // Check that 'ty' is 'expected' or 'any'
 bool isExpectedOrUnknownBytecodeType(uint8_t ty, LuauBytecodeType expected);
 
+// Tag recorded at runtime on the register at the bytecode instruction
+LuauBytecodeType getTagFeedback(const IrFunction& function, int pcpos, int reg);
+
+// Userdata recorded at runtime on the register at the bytecode instruction
+std::optional<BytecodeUserdataFeedback> getUserdataFeedback(const IrFunction& function, int pcpos, int reg);
+
 HostMetamethod tmToHostMetamethod(int tm);
 
 // Manually add or remove use of an operand
@@ -236,6 +252,8 @@ void applySubstitutions(IrFunction& function, IrInst& inst);
 
 // Compare numbers using IR condition value
 bool compare(double a, double b, IrCondition cond);
+bool compare(int a, int b, IrCondition cond);
+bool compare(int64_t a, int64_t b, IrCondition cond);
 
 // Perform constant folding on instruction at index
 // For most instructions, successful folding results in a IrCmd::SUBSTITUTE

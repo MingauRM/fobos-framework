@@ -3,6 +3,8 @@
 
 #include "Luau/Common.h"
 
+LUAU_FASTFLAG(LuauExperimentalIfLocalSyntax)
+LUAU_FASTFLAG(LuauExperimentalWhileLocalSyntax)
 
 namespace Luau
 {
@@ -238,6 +240,7 @@ AstExprCall::AstExprCall(
     AstExpr* func,
     const AstArray<AstExpr*>& args,
     bool self,
+    bool tableCall,
     const AstArray<AstTypeOrPack>& explicitTypes,
     const Location& argLocation
 )
@@ -246,6 +249,7 @@ AstExprCall::AstExprCall(
     , typeArguments(explicitTypes)
     , args(args)
     , self(self)
+    , tableCall(tableCall)
     , argLocation(argLocation)
 {
 }
@@ -267,7 +271,8 @@ AstExprIndexName::AstExprIndexName(
     const AstName& index,
     const Location& indexLocation,
     const Position& opPosition,
-    char op
+    char op,
+    bool privateAccess
 )
     : AstExpr(ClassIndex(), location)
     , expr(expr)
@@ -275,6 +280,7 @@ AstExprIndexName::AstExprIndexName(
     , indexLocation(indexLocation)
     , opPosition(opPosition)
     , op(op)
+    , privateAccess(privateAccess)
 {
 }
 
@@ -520,10 +526,38 @@ AstExprIfElse::AstExprIfElse(const Location& location, AstExpr* condition, bool 
 {
 }
 
+AstExprIfElse::AstExprIfElse(
+    const Location& location,
+    AstExpr* condition,
+    bool hasThen,
+    AstExpr* trueExpr,
+    bool hasElse,
+    AstExpr* falseExpr,
+    AstLocal* conditionLocal,
+    bool conditionIsConst,
+    const std::optional<Location>& conditionKeywordLocation,
+    const std::optional<Location>& conditionEqualsLocation
+)
+    : AstExpr(ClassIndex(), location)
+    , condition(condition)
+    , hasThen(hasThen)
+    , trueExpr(trueExpr)
+    , hasElse(hasElse)
+    , falseExpr(falseExpr)
+    , conditionLocal(conditionLocal)
+    , conditionIsConst(conditionIsConst)
+    , conditionKeywordLocation(conditionKeywordLocation)
+    , conditionEqualsLocation(conditionEqualsLocation)
+{
+}
+
 void AstExprIfElse::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        if (FFlag::LuauExperimentalIfLocalSyntax && conditionLocal && conditionLocal->annotation)
+            conditionLocal->annotation->visit(visitor);
+
         condition->visit(visitor);
         trueExpr->visit(visitor);
         falseExpr->visit(visitor);
@@ -612,10 +646,38 @@ AstStatIf::AstStatIf(
 {
 }
 
+AstStatIf::AstStatIf(
+    const Location& location,
+    AstExpr* condition,
+    AstStatBlock* thenbody,
+    AstStat* elsebody,
+    const std::optional<Location>& thenLocation,
+    const std::optional<Location>& elseLocation,
+    AstLocal* conditionLocal,
+    bool conditionIsConst,
+    const std::optional<Location>& conditionKeywordLocation,
+    const std::optional<Location>& conditionEqualsLocation
+)
+    : AstStat(ClassIndex(), location)
+    , condition(condition)
+    , thenbody(thenbody)
+    , elsebody(elsebody)
+    , thenLocation(thenLocation)
+    , elseLocation(elseLocation)
+    , conditionLocal(conditionLocal)
+    , conditionIsConst(conditionIsConst)
+    , conditionKeywordLocation(conditionKeywordLocation)
+    , conditionEqualsLocation(conditionEqualsLocation)
+{
+}
+
 void AstStatIf::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        if (FFlag::LuauExperimentalIfLocalSyntax && conditionLocal && conditionLocal->annotation)
+            conditionLocal->annotation->visit(visitor);
+
         condition->visit(visitor);
         thenbody->visit(visitor);
 
@@ -633,10 +695,36 @@ AstStatWhile::AstStatWhile(const Location& location, AstExpr* condition, AstStat
 {
 }
 
+AstStatWhile::AstStatWhile(
+    const Location& location,
+    AstExpr* condition,
+    AstStatBlock* body,
+    bool hasDo,
+    const Location& doLocation,
+    AstLocal* conditionLocal,
+    bool conditionIsConst,
+    const std::optional<Location>& conditionKeywordLocation,
+    const std::optional<Location>& conditionEqualsLocation
+)
+    : AstStat(ClassIndex(), location)
+    , condition(condition)
+    , body(body)
+    , hasDo(hasDo)
+    , doLocation(doLocation)
+    , conditionLocal(conditionLocal)
+    , conditionIsConst(conditionIsConst)
+    , conditionKeywordLocation(conditionKeywordLocation)
+    , conditionEqualsLocation(conditionEqualsLocation)
+{
+}
+
 void AstStatWhile::visit(AstVisitor* visitor)
 {
     if (visitor->visit(this))
     {
+        if (FFlag::LuauExperimentalWhileLocalSyntax && conditionLocal && conditionLocal->annotation)
+            conditionLocal->annotation->visit(visitor);
+
         condition->visit(visitor);
         body->visit(visitor);
     }
@@ -864,13 +952,7 @@ void AstStatFunction::visit(AstVisitor* visitor)
     }
 }
 
-AstStatLocalFunction::AstStatLocalFunction(
-    const Location& location,
-    AstLocal* name,
-    AstExprFunction* func,
-    bool isConst,
-    Position constKeywordBegin
-)
+AstStatLocalFunction::AstStatLocalFunction(const Location& location, AstLocal* name, AstExprFunction* func, bool isConst, Position constKeywordBegin)
     : AstStat(ClassIndex(), location)
     , name(name)
     , func(func)
@@ -985,11 +1067,13 @@ AstStatDeclareFunction::AstStatDeclareFunction(
 {
 }
 
-AstStatClass::AstStatClass(const Location& location, AstLocal* name, AstArray<AstClassMember> members, bool exported)
+AstStatClass::AstStatClass(const Location& location, AstLocal* name, AstExpr* super, AstArray<AstClassMember> members, bool exported, bool open)
     : AstStat(ClassIndex(), location)
     , name(name)
+    , super(super)
     , members(members)
     , exported(exported)
+    , open(open)
 {
     LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
 }
@@ -999,6 +1083,9 @@ void AstStatClass::visit(AstVisitor* visitor)
     LUAU_ASSERT(FFlag::DebugLuauUserDefinedClasses);
     if (visitor->visit(this))
     {
+        if (super)
+            super->visit(visitor);
+
         for (const auto& member : members)
         {
             Luau::visit(
@@ -1154,10 +1241,11 @@ void AstTypeReference::visit(AstVisitor* visitor)
     }
 }
 
-AstTypeTable::AstTypeTable(const Location& location, const AstArray<AstTableProp>& props, AstTableIndexer* indexer)
+AstTypeTable::AstTypeTable(const Location& location, const AstArray<AstTableProp>& props, AstTableIndexer* indexer, bool isExact)
     : AstType(ClassIndex(), location)
     , props(props)
     , indexer(indexer)
+    , isExact(isExact)
 {
 }
 

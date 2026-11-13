@@ -7,11 +7,10 @@
 
 LUAU_FASTFLAG(LuauIntegerLibrary)
 LUAU_FASTFLAG(DebugLuauUserDefinedClassesRuntime)
+LUAU_FASTFLAGVARIABLE(LuauSandboxFreezesVectorMetatable)
 
 static const luaL_Reg lualibs[] = {
     {"", luaopen_base},
-    {LUA_RUNTIMEDATANAME, luaopen_RUNTIME},
-    {LUAU_VERSIONNAME, luaopen_LUAU},
     {LUA_COLIBNAME, luaopen_coroutine},
     {LUA_TABLIBNAME, luaopen_table},
     {LUA_OSLIBNAME, luaopen_os},
@@ -22,16 +21,12 @@ static const luaL_Reg lualibs[] = {
     {LUA_BITLIBNAME, luaopen_bit32},
     {LUA_BUFFERLIBNAME, luaopen_buffer},
     {LUA_VECLIBNAME, luaopen_vector},
-    {LUA_SIGNALLIBNAME, luaopen_signal},
-    {LUA_FILELIBNAME, luaopen_file},
     {LUA_INTLIBNAME, luaopen_integer},
     {NULL, NULL},
 };
 
 static const luaL_Reg lualibs_NOINTEGER[] = {
     {"", luaopen_base},
-    {LUA_RUNTIMEDATANAME, luaopen_RUNTIME},
-    {LUAU_VERSIONNAME, luaopen_LUAU},
     {LUA_COLIBNAME, luaopen_coroutine},
     {LUA_TABLIBNAME, luaopen_table},
     {LUA_OSLIBNAME, luaopen_os},
@@ -42,8 +37,6 @@ static const luaL_Reg lualibs_NOINTEGER[] = {
     {LUA_BITLIBNAME, luaopen_bit32},
     {LUA_BUFFERLIBNAME, luaopen_buffer},
     {LUA_VECLIBNAME, luaopen_vector},
-    {LUA_SIGNALLIBNAME, luaopen_signal},
-    {LUA_FILELIBNAME, luaopen_file},
     {NULL, NULL},
 };
 
@@ -92,6 +85,24 @@ void luaL_sandbox(lua_State* L)
     else
     {
         lua_pop(L, 1);
+    }
+
+    if (FFlag::LuauSandboxFreezesVectorMetatable)
+    {
+#if LUA_VECTOR_SIZE == 4
+        lua_pushvector(L, 0.0f, 0.0f, 0.0f, 0.0f);
+#else
+        lua_pushvector(L, 0.0f, 0.0f, 0.0f);
+#endif
+        if (lua_getmetatable(L, -1))
+        {
+            lua_setreadonly(L, -1, true);
+            lua_pop(L, 2);
+        }
+        else
+        {
+            lua_pop(L, 1);
+        }
     }
 
     // set globals to readonly and activate safeenv since the env is immutable

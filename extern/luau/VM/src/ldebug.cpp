@@ -8,36 +8,40 @@
 #include "lgc.h"
 #include "ldo.h"
 #include "lbytecode.h"
+#include "lvm.h"
 
 #include <string.h>
 #include <stdio.h>
 
-LUAU_FASTFLAG(LuauCIProto)
+LUAU_FASTFLAG(LuauPromoteProto)
+LUAU_FASTFLAGVARIABLE(LuauSkipDebugLocked)
 
 static const char* getfuncname(Closure* cl);
 
+static Proto* getlatestproto(Proto* p)
+{
+    if (FFlag::LuauPromoteProto)
+    {
+        while (p->optimized)
+            p = p->optimized;
+    }
+
+    return p;
+}
+
 static int currentpc(lua_State* L, CallInfo* ci)
 {
-    if (FFlag::LuauCIProto)
-        return pcRel(ci->savedpc, ci->p);
-    else
-        return pcRel(ci->savedpc, ci_func(ci)->l.p);
+    return pcRel(ci->savedpc, ci->p);
 }
 
 static int currentline(lua_State* L, CallInfo* ci)
 {
-    if (FFlag::LuauCIProto)
-        return luaG_getline(ci->p, currentpc(L, ci));
-    else
-        return luaG_getline(ci_func(ci)->l.p, currentpc(L, ci));
+    return luaG_getline(ci->p, currentpc(L, ci));
 }
 
 static Proto* getluaproto(CallInfo* ci)
 {
-    if (FFlag::LuauCIProto)
-        return cast_to(Proto*, ci->p);
-    else
-        return (isLua(ci) ? cast_to(Proto*, ci_func(ci)->l.p) : NULL);
+    return cast_to(Proto*, ci->p);
 }
 
 int lua_getargument(lua_State* L, int level, int n)
@@ -132,10 +136,10 @@ static Closure* auxgetinfo(lua_State* L, const char* what, lua_Debug* ar, Closur
             }
             else
             {
-                TString* source = (FFlag::LuauCIProto && ci != nullptr ? ci->p : f->l.p)->source;
+                TString* source = (ci != nullptr ? ci->p : f->l.p)->source;
                 ar->source = getstr(source);
                 ar->what = "Lua";
-                ar->linedefined = (FFlag::LuauCIProto && ci != nullptr ? ci->p : f->l.p)->linedefined;
+                ar->linedefined = (ci != nullptr ? ci->p : f->l.p)->linedefined;
                 ar->short_src = luaO_chunkid(ar->ssbuf, sizeof(ar->ssbuf), getstr(source), source->len);
             }
             break;
@@ -167,8 +171,23 @@ static Closure* auxgetinfo(lua_State* L, const char* what, lua_Debug* ar, Closur
             }
             else
             {
-                ar->isvararg = (FFlag::LuauCIProto && ci != nullptr ? ci->p : f->l.p)->is_vararg;
-                ar->nparams = (FFlag::LuauCIProto && ci != nullptr ? ci->p : f->l.p)->numparams;
+                ar->isvararg = (ci != nullptr ? ci->p : f->l.p)->is_vararg;
+                ar->nparams = (ci != nullptr ? ci->p : f->l.p)->numparams;
+            }
+            break;
+        }
+        case 'p':
+        {
+            if (f->isC)
+            {
+                ar->protoid = 0;
+                ar->bytecodeid = -1;
+            }
+            else
+            {
+                Proto* p = ci != nullptr ? ci->p : f->l.p;
+                ar->protoid = int(p->funid);
+                ar->bytecodeid = p->bytecodeid;
             }
             break;
         }
@@ -186,6 +205,14 @@ static Closure* auxgetinfo(lua_State* L, const char* what, lua_Debug* ar, Closur
         }
     }
     return cl;
+}
+
+void lua_callhook(lua_State* L, lua_Hook hook, void* userdata)
+{
+    api_check(L, hook != nullptr);
+    api_check(L, L->ci != L->base_ci);
+
+    return luau_callhook(L, hook, userdata);
 }
 
 int lua_stackdepth(lua_State* L)
@@ -234,10 +261,8 @@ static const char* getfuncname(Closure* cl)
 {
     if (cl->isC)
     {
-        if (cl->c.debugname)
-        {
-            return cl->c.debugname;
-        }
+        if (TString* str = cl->c.debugname)
+            return getstr(str);
     }
     else
     {
@@ -395,6 +420,9 @@ void luaG_breakpoint(lua_State* L, Proto* p, int line, bool enable)
             p->code[i] |= op;
             LUAU_ASSERT(LUAU_INSN_OP(p->code[i]) == op);
 
+            if (FFlag::LuauSkipDebugLocked && enable)
+                p->execflags |= PEF_DEBUGLOCKED;
+
             // currently we don't restore native code when breakpoint is disabled.
             // this will be addressed in the future.
             if (enable && p->execdata && ondisable)
@@ -409,7 +437,7 @@ void luaG_breakpoint(lua_State* L, Proto* p, int line, bool enable)
 
     for (int i = 0; i < p->sizep; ++i)
     {
-        luaG_breakpoint(L, p->p[i], line, enable);
+        luaG_breakpoint(L, FFlag::LuauSkipDebugLocked ? getlatestproto(p->p[i]) : p->p[i], line, enable);
     }
 }
 
@@ -506,7 +534,7 @@ static int getnextline(Proto* p, int line)
 
     for (int i = 0; i < p->sizep; ++i)
     {
-        int candidate = getnextline(p->p[i], line);
+        int candidate = getnextline(FFlag::LuauSkipDebugLocked ? getlatestproto(p->p[i]) : p->p[i], line);
 
         if (candidate == line)
             return line;
@@ -523,7 +551,7 @@ int lua_breakpoint(lua_State* L, int funcindex, int line, int enabled)
     const TValue* func = luaA_toobject(L, funcindex);
     api_check(L, ttisfunction(func) && !clvalue(func)->isC);
 
-    Proto* p = clvalue(func)->l.p;
+    Proto* p = FFlag::LuauSkipDebugLocked ? getlatestproto(clvalue(func)->l.p) : clvalue(func)->l.p;
 
     // set the breakpoint to the next closest line with valid instructions
     int target = getnextline(p, line);
@@ -532,6 +560,11 @@ int lua_breakpoint(lua_State* L, int funcindex, int line, int enabled)
         luaG_breakpoint(L, p, target, bool(enabled));
 
     return target;
+}
+
+int lua_atbreakpoint(lua_State* L)
+{
+    return luaG_onbreak(L) ? 1 : 0;
 }
 
 static void getcoverage(Proto* p, int depth, int* buffer, size_t size, void* context, lua_Coverage callback)
@@ -580,6 +613,8 @@ void lua_getcoverage(lua_State* L, int funcindex, void* context, lua_Coverage ca
 
 static void getcounters(lua_State* L, Proto* p, void* context, lua_CounterFunction functionvisit, lua_CounterValue countervisit)
 {
+    p = getlatestproto(p);
+
     if (p->execdata != nullptr && L->global->ecb.getcounterdata != nullptr)
     {
         size_t count = 0;

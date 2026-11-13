@@ -13,10 +13,15 @@
 #include "lnumutils.h"
 
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 #include <limits.h>
 #include <math.h>
+
+LUAU_FASTFLAG(LuauCodegenPropagateFallbackTags)
+LUAU_FASTFLAGVARIABLE(LuauCodegenUpdateSafeEnvList)
+LUAU_FASTFLAGVARIABLE(LuauCodegenCmpAnySideEffecting)
 
 namespace Luau
 {
@@ -58,6 +63,10 @@ int getOpLength(LuauOpcode op)
     case LOP_NEWCLASSMEMBER:
     case LOP_CALLFB:
     case LOP_CMPPROTO:
+    case LOP_NEWCLASS:
+    case LOP_CONSTRUCT:
+    case LOP_GETPRIVATEFIELD:
+    case LOP_SETPRIVATEFIELD:
         return 2;
 
     default:
@@ -118,6 +127,8 @@ bool isFastCall(LuauOpcode op)
     case LOP_FASTCALL2:
     case LOP_FASTCALL2K:
     case LOP_FASTCALL3:
+    case LOP_FASTPCALL:
+    case LOP_FINCONSTRUCT:
         return true;
 
     default:
@@ -266,6 +277,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::JUMP_IF_FALSY:
     case IrCmd::JUMP_EQ_TAG:
     case IrCmd::JUMP_CMP_INT:
+    case IrCmd::JUMP_CMP_INT64:
     case IrCmd::JUMP_EQ_POINTER:
     case IrCmd::JUMP_CMP_NUM:
     case IrCmd::JUMP_CMP_FLOAT:
@@ -285,6 +297,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
         return IrValueKind::Int;
     case IrCmd::TRY_CALL_FASTGETTM:
     case IrCmd::NEW_USERDATA:
+    case IrCmd::NEW_VECTOR:
         return IrValueKind::Pointer;
     case IrCmd::INT64_TO_NUM:
     case IrCmd::INT_TO_NUM:
@@ -314,8 +327,10 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::INVOKE_FASTCALL:
         return IrValueKind::Int;
     case IrCmd::CHECK_FASTCALL_RES:
+    case IrCmd::INVOKE_FASTPCALL:
     case IrCmd::DO_ARITH:
     case IrCmd::DO_LEN:
+    case IrCmd::CONSTRUCT:
     case IrCmd::GET_TABLE:
     case IrCmd::SET_TABLE:
     case IrCmd::GET_CACHED_IMPORT:
@@ -329,6 +344,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::CHECK_READONLY:
     case IrCmd::CHECK_NO_METATABLE:
     case IrCmd::CHECK_SAFE_ENV:
+    case IrCmd::CHECK_YIELDABLE:
     case IrCmd::CHECK_ARRAY_SIZE:
     case IrCmd::CHECK_SLOT_MATCH:
     case IrCmd::CHECK_NODE_NO_NEXT:
@@ -340,6 +356,7 @@ IrValueKind getCmdValueKind(IrCmd cmd)
     case IrCmd::CHECK_CMP_INT64:
     case IrCmd::INTERRUPT:
     case IrCmd::CHECK_GC:
+    case IrCmd::UPDATE_COUNTERS:
     case IrCmd::BARRIER_OBJ:
     case IrCmd::BARRIER_TABLE_BACK:
     case IrCmd::BARRIER_TABLE_FORWARD:
@@ -446,7 +463,7 @@ static void removeInstUse(IrFunction& function, uint32_t instIdx)
     CODEGEN_ASSERT(inst.useCount);
     inst.useCount--;
 
-    if (inst.useCount == 0)
+    if (inst.useCount == 0 && (!FFlag::LuauCodegenCmpAnySideEffecting || !hasSideEffects(inst.cmd)))
         kill(function, inst);
 }
 
@@ -499,6 +516,91 @@ bool isCustomUserdataBytecodeType(uint8_t ty)
 bool isExpectedOrUnknownBytecodeType(uint8_t ty, LuauBytecodeType expected)
 {
     return ty == LBC_TYPE_ANY || ty == expected;
+}
+
+static LuauBytecodeType getBytecodeTypeForTag(uint8_t tag)
+{
+    switch (tag)
+    {
+    case LUA_TNIL:
+        return LBC_TYPE_NIL;
+    case LUA_TBOOLEAN:
+        return LBC_TYPE_BOOLEAN;
+    case LUA_TLIGHTUSERDATA:
+        return LBC_TYPE_ANY; // Doesn't have an LBC mapping
+    case LUA_TNUMBER:
+        return LBC_TYPE_NUMBER;
+    case LUA_TINTEGER:
+        return LBC_TYPE_INTEGER;
+    case LUA_TVECTOR:
+        return LBC_TYPE_VECTOR;
+    case LUA_TSTRING:
+        return LBC_TYPE_STRING;
+    case LUA_TTABLE:
+        return LBC_TYPE_TABLE;
+    case LUA_TFUNCTION:
+        return LBC_TYPE_FUNCTION;
+    case LUA_TUSERDATA:
+        return LBC_TYPE_USERDATA;
+    case LUA_TTHREAD:
+        return LBC_TYPE_THREAD;
+    case LUA_TBUFFER:
+        return LBC_TYPE_BUFFER;
+    case LUA_TCLASS:
+        return LBC_TYPE_CLASS;
+    case LUA_TOBJECT:
+        return LBC_TYPE_OBJECT;
+    }
+
+    return LBC_TYPE_ANY;
+}
+
+LuauBytecodeType getTagFeedback(const IrFunction& function, int pcpos, int reg)
+{
+    const std::vector<BytecodeTagFeedback>& tags = function.feedback.tags;
+
+    auto it = std::lower_bound(
+        tags.begin(),
+        tags.end(),
+        uint32_t(pcpos),
+        [](const BytecodeTagFeedback& item, uint32_t pcpos)
+        {
+            return item.pcpos < pcpos;
+        }
+    );
+
+    // There could be multiple items at the position
+    for (; it != tags.end() && it->pcpos == uint32_t(pcpos); ++it)
+    {
+        if (it->reg == reg)
+            return getBytecodeTypeForTag(it->tag);
+    }
+
+    return LBC_TYPE_ANY;
+}
+
+std::optional<BytecodeUserdataFeedback> getUserdataFeedback(const IrFunction& function, int pcpos, int reg)
+{
+    const std::vector<BytecodeUserdataFeedback>& userdataTypes = function.feedback.userdataTypes;
+
+    auto it = std::lower_bound(
+        userdataTypes.begin(),
+        userdataTypes.end(),
+        uint32_t(pcpos),
+        [](const BytecodeUserdataFeedback& item, uint32_t pcpos)
+        {
+            return item.pcpos < pcpos;
+        }
+    );
+
+    // There could be multiple items at the position
+    for (; it != userdataTypes.end() && it->pcpos == uint32_t(pcpos); ++it)
+    {
+        if (it->reg == reg)
+            return *it;
+    }
+
+    return std::nullopt;
 }
 
 HostMetamethod tmToHostMetamethod(int tm)
@@ -1133,6 +1235,15 @@ void foldConstants(IrBuilder& build, IrFunction& function, IrBlock& block, uint3
         if (OP_A(inst).kind == IrOpKind::Constant && OP_B(inst).kind == IrOpKind::Constant)
         {
             if (compare(function.intOp(OP_A(inst)), function.intOp(OP_B(inst)), conditionOp(OP_C(inst))))
+                replace(function, block, index, {IrCmd::JUMP, {OP_D(inst)}});
+            else
+                replace(function, block, index, {IrCmd::JUMP, {OP_E(inst)}});
+        }
+        break;
+    case IrCmd::JUMP_CMP_INT64:
+        if (OP_A(inst).kind == IrOpKind::Constant && OP_B(inst).kind == IrOpKind::Constant)
+        {
+            if (compare(function.int64Op(OP_A(inst)), function.int64Op(OP_B(inst)), conditionOp(OP_C(inst))))
                 replace(function, block, index, {IrCmd::JUMP, {OP_D(inst)}});
             else
                 replace(function, block, index, {IrCmd::JUMP, {OP_E(inst)}});
@@ -1862,6 +1973,10 @@ void propagateTagsFromPredecessors(
     if (blockIdx >= function.cfg.predecessorsOffsets.size())
         return;
 
+    // Entry block has an implicit edge as the function start and it has no tag info at that moment
+    if (FFlag::LuauCodegenPropagateFallbackTags && function.entryBlock == blockIdx)
+        return;
+
     BlockIteratorWrapper preds = predecessors(function.cfg, blockIdx);
 
     if (preds.empty())
@@ -1873,6 +1988,9 @@ void propagateTagsFromPredecessors(
 
     for (uint32_t predIdx : preds)
     {
+        if (function.blocks[predIdx].kind == IrBlockKind::Dead)
+            continue;
+
         if (predIdx >= numBlockExitTags)
             return;
 
@@ -1885,6 +2003,9 @@ void propagateTagsFromPredecessors(
 
     for (uint32_t predIdx : preds)
     {
+        if (function.blocks[predIdx].kind == IrBlockKind::Dead)
+            continue;
+
         const std::vector<uint8_t>& predTags = function.blockExitTags[predIdx];
 
         CODEGEN_ASSERT(minRegsKnown <= predTags.size());
@@ -1936,6 +2057,10 @@ std::optional<uint8_t> tryGetLuauTagForBcType(uint8_t bcType, bool ignoreOptiona
         return LUA_TVECTOR;
     case LBC_TYPE_BUFFER:
         return LUA_TBUFFER;
+    case LBC_TYPE_CLASS:
+        return LUA_TCLASS;
+    case LBC_TYPE_OBJECT:
+        return LUA_TOBJECT;
     default:
         if (bcType >= LBC_TYPE_TAGGED_USERDATA_BASE && bcType < LBC_TYPE_TAGGED_USERDATA_END)
             return LUA_TUSERDATA;

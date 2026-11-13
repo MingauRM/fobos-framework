@@ -24,6 +24,9 @@ enum class CodeGenCounter : unsigned
     RegularBlockExecuted = 1,
     FallbackBlockExecuted = 2,
     VmExitTaken = 3,
+
+    VmRegTagMismatch = 4,
+    VmRegUserdataTag = 5,
 };
 
 using AllocationCallback = void(void* context, void* oldPointer, size_t oldSize, void* newPointer, size_t newSize);
@@ -129,6 +132,9 @@ struct CompilationOptions
 
     bool recordCounters = false;
 
+    // Compile with runtime counters which will guide further recompilation of native code
+    bool runtimeFeedback = false;
+
     // When true, random NOP sleds are inserted between blocks to
     // make intra-function gadget offsets unpredictable.
     bool nopPadding = false;
@@ -150,7 +156,7 @@ enum class IncludeUseInfo
     Yes
 };
 
-// Output CFG informations like block predecessors, successors and etc
+// Output CFG information like block predecessors, successors and etc
 enum class IncludeCfgInfo
 {
     No,
@@ -185,6 +191,7 @@ struct AssemblyOptions
     bool includeIr = false;
     bool includeOutlinedCode = false;
     bool includeIrTypes = false;
+    bool includeRegSpills = false;
 
     IncludeIrPrefix includeIrPrefix = IncludeIrPrefix::Yes;
     IncludeUseInfo includeUseInfo = IncludeUseInfo::Yes;

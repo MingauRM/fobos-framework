@@ -2,6 +2,7 @@
 #pragma once
 
 #include "Luau/Bytecode.h"
+#include "Luau/CodeGenOptions.h"
 #include "Luau/DenseHash.h"
 #include "Luau/IrAnalysis.h"
 #include "Luau/Label.h"
@@ -417,6 +418,13 @@ enum class IrCmd : uint8_t
     // E: block (if false)
     JUMP_CMP_INT,
 
+    // Perform a conditional jump based on the result of int64 comparison
+    // A, B: int64
+    // C: condition
+    // D: block (if true)
+    // E: block (if false)
+    JUMP_CMP_INT64,
+
     // Jump if pointers are equal
     // A, B: pointer (*)
     // C: block (if true)
@@ -489,6 +497,12 @@ enum class IrCmd : uint8_t
     // A: int (size)
     // B: int (tag)
     NEW_USERDATA,
+
+    // Create new heap-allocated vector
+    // A: double (x)
+    // B: double (y)
+    // C: double (z)
+    NEW_VECTOR,
 
     // Convert integer into a double number
     // A: int
@@ -571,6 +585,16 @@ enum class IrCmd : uint8_t
     // B: block (fallback)
     CHECK_FASTCALL_RES,
 
+    // Call the fast protected call function
+    // - if function yields, performs a yield
+    // - if a target Luau function needs to run, switches execution to it
+    // - continues if the target call resolved immediately
+    // A: Rn (result start)
+    // B: unsigned int (protected function id)
+    // C: int (argument count or -1 to use all arguments up to stack top)
+    // D: int (result count or -1 to preserve all results and adjust stack top)
+    INVOKE_FASTPCALL,
+
     // Fallback functions
 
     // Perform an arithmetic operation on TValues of any type
@@ -584,6 +608,12 @@ enum class IrCmd : uint8_t
     // A: Rn (where to store the result)
     // B: Rn
     DO_LEN,
+
+    // Construct a class object or a table, if the constructor is a class and shape in the CONSTRUCT feedback slot matches it
+    // A: Rn (where to store the result)
+    // B: Rn (constructor)
+    // C: unsigned int (feedback slot id)
+    CONSTRUCT,
 
     // Lookup a value in TValue of any type using a key of any type
     // A: Rn (where to store the result)
@@ -653,6 +683,11 @@ enum class IrCmd : uint8_t
     // A: block/vmexit/undef
     // When undef is specified, execution is aborted on check failure
     CHECK_SAFE_ENV,
+
+    // Guard against executing in a non-yieldable context, exits to VM on check failure
+    // A: block/vmexit/undef
+    // When undef is specified, execution is aborted on check failure
+    CHECK_YIELDABLE,
 
     // Guard against index overflowing the table array size
     // A: pointer (LuaTable)
@@ -727,6 +762,10 @@ enum class IrCmd : uint8_t
 
     // Check and run GC assist if necessary
     CHECK_GC,
+
+    // Update runtime counters from the counter set
+    // A: unsigned int (counter set index)
+    UPDATE_COUNTERS,
 
     // Handle GC write barrier (forward)
     // A: pointer (GCObject)
@@ -1184,7 +1223,7 @@ struct IrInst
     IrOps ops;
 
     uint32_t lastUse = 0;
-    uint16_t useCount = 0;
+    uint32_t useCount = 0;
 
     // Location of the result (optional)
     X64::RegisterX64 regX64 = X64::noreg;
@@ -1314,6 +1353,20 @@ struct IrInstEq
     }
 };
 
+struct IrEntryCounter
+{
+    CodeGenCounter kind = CodeGenCounter::VmRegTagMismatch;
+    IrOp operand;
+    uint32_t pcpos = ~0u;
+
+    uint8_t expectedTag = kUnknownTag; // tag expected by fast path falling back to this counter
+};
+
+struct IrCounterSet
+{
+    SmallVector<IrEntryCounter, 4> counters;
+};
+
 enum class IrBlockKind : uint8_t
 {
     Bytecode,
@@ -1334,7 +1387,7 @@ struct IrBlock
 {
     IrBlockKind kind;
     uint8_t flags = 0;
-    uint16_t useCount = 0;
+    uint32_t useCount = 0;
 
     // 'start' and 'finish' define an inclusive range of instructions which belong to this block inside the function
     // When block has been constructed, 'finish' always points to the first and only terminating instruction
@@ -1349,6 +1402,8 @@ struct IrBlock
     uint32_t startpc = kBlockNoStartPc;
 
     Label label;
+
+    uint32_t counterSet = ~0u;
 };
 
 struct BytecodeMapping
@@ -1391,12 +1446,51 @@ struct BytecodeTypeInfo
     std::vector<uint32_t> regTypeOffsets;
 };
 
+// VM register tag that was recorded at the bytecode instruction at runtime
+struct BytecodeTagFeedback
+{
+    uint32_t pcpos = 0;
+    uint8_t reg = 0;
+    uint8_t tag = 0;
+
+    bool operator==(const BytecodeTagFeedback& rhs) const
+    {
+        return pcpos == rhs.pcpos && reg == rhs.reg && tag == rhs.tag;
+    }
+};
+
+struct BytecodeUserdataFeedback
+{
+    uint32_t pcpos = 0;
+    uint8_t reg = 0;
+    uint8_t tag = 0;             // Runtime tag
+    uint8_t type = LBC_TYPE_ANY; // Bytecode type
+
+    bool operator==(const BytecodeUserdataFeedback& rhs) const
+    {
+        return pcpos == rhs.pcpos && reg == rhs.reg && tag == rhs.tag && type == rhs.type;
+    }
+};
+
+// Feedback recorded about the function at runtime
+struct BytecodeFeedback
+{
+    std::vector<BytecodeTagFeedback> tags;               // Sorted by pcpos
+    std::vector<BytecodeUserdataFeedback> userdataTypes; // Sorted by pcpos
+
+    bool operator==(const BytecodeFeedback& rhs) const
+    {
+        return tags == rhs.tags && userdataTypes == rhs.userdataTypes;
+    }
+};
+
 struct ValueRestoreLocation
 {
-    IrOp op;             // Operand representing the location (Rn/Kn)
-    IrValueKind kind;    // The kind of value at the restore location
-    IrCmd conversionCmd; // Type conversion instruction that was used to store the value at the restore location
-    bool lazy;           // This location comes from a DSE hint and is emitted on demand (see StoreLocationHint)
+    IrOp op;                                  // Operand representing the location (Rn/Kn)
+    IrValueKind kind;                         // The kind of value at the restore location
+    IrCmd conversionCmd;                      // Type conversion instruction that was used to store the value at the restore location
+    bool lazy;                                // This location comes from a DSE hint and is emitted on demand (see StoreLocationHint)
+    uint32_t sourceInstIdx = kInvalidInstIdx; // Instruction that is the source of the conversion
 };
 
 struct StoreLocationHint
@@ -1427,6 +1521,12 @@ struct VmExitSyncInfo
     SmallVector<IrOp, 2> argOps;
 };
 
+struct VmEnvironmentInfo
+{
+    bool hasPcall = false;
+    bool hasXpcall = false;
+};
+
 struct IrFunction
 {
     std::vector<IrBlock> blocks;
@@ -1446,13 +1546,18 @@ struct IrFunction
     // For each instruction, an operand that can be used to recompute the value
     std::vector<ValueRestoreLocation> valueRestoreOps;
     std::vector<uint32_t> validRestoreOpBlocks;
-    DenseHashMap<uint32_t, StoreLocationHint> storeLocationHints{kInvalidInstIdx};
+    DenseHashMap<uint32_t, StoreLocationHint> storeLocationHints;
 
-    DenseHashMap<uint32_t, VmExitSyncInfo> vmExitInfo{kInvalidInstIdx};
-    DenseHashMap<uint32_t, uint32_t> blockToVmExitMap{~0u};
+    DenseHashMap<uint32_t, VmExitSyncInfo> vmExitInfo;
+    DenseHashMap<uint32_t, uint32_t> blockToVmExitMap;
 
     BytecodeTypeInfo bcOriginalTypeInfo; // Bytecode type information as loaded
     BytecodeTypeInfo bcTypeInfo;         // Bytecode type information with additional inferences
+
+    std::vector<IrCounterSet> counterSets;
+    BytecodeFeedback feedback;
+
+    VmEnvironmentInfo envInfo;
 
     Proto* proto = nullptr;
     bool variadic = false;
@@ -1461,12 +1566,17 @@ struct IrFunction
 
     LoweringStats* stats = nullptr;
 
-    bool recordCounters = false; // Taken from CompilationOptions for easy access
+    // Taken from CompilationOptions for easy access
+    bool recordCounters = false;
+    bool recordFeedback = false;
 
     uint64_t jitRngState = 0; // PCG32 state for NOP padding; seeded per-function in lowerFunction
 
     // Stores register tags that are known after constant propagating through a block, indexed by that block's index
     std::vector<std::vector<uint8_t>> blockExitTags; // blockIdx → tag array
+
+    // Known VM register tag values on fallback entry (intersection of data from each individual jump point)
+    std::vector<std::vector<uint8_t>> fallbackEntryTags;
 
     IrBlock& blockOp(IrOp op)
     {

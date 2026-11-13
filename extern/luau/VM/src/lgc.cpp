@@ -12,13 +12,20 @@
 #include "ludata.h"
 #include "lbuffer.h"
 #include "lclass.h"
+#include "lvector.h"
 
 #include <string.h>
 
-LUAU_FASTFLAG(LuauUdataDirectAccess6)
-LUAU_FASTFLAG(LuauDirectFieldGet)
-LUAU_FASTFLAGVARIABLE(LuauUdataMetatablePinned)
-LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcTableStepFix, false)
+#include <cstddef>
+
+LUAU_FASTFLAGVARIABLE(LuauGcTraceUdata)
+LUAU_FLAGVERSION(LuauGcTraceUdata, 5)
+LUAU_FASTFLAG(LuauFastpcall)
+LUAU_FASTFLAG(LuauCoroutineFinally)
+LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcHeapShrinkFix, false)
+LUAU_FASTFLAGVARIABLE(LuauRuntimeFeedback)
+LUAU_FASTFLAG(LuauBufferSweep)
+LUAU_FASTFLAG(LuauLoadExplicitGcDisable)
 
 /*
  * Luau uses an incremental non-generational non-moving mark&sweep garbage collector.
@@ -101,12 +108,7 @@ LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcTableStepFix, false)
  * all objects are marked, we traverse all weak tables (that are linked into special weak table lists using `gclist` during marking),
  * and remove all entries that have white keys or values. If keys or values are strong, they are marked normally.
  *
- * The simplified scheme described above isn't fully accurate because of threads, upvalues and strings.
- *
- * Strings are semantically black (they are initially white, and when the mark stage reaches a string, it changes its color and never
- * touches the object again), but they are technically marked as gray - the black bit is never set on a string object. This behavior
- * is inherited from Lua 5.1 GC, but doesn't have a clear rationale - effectively, strings are marked as gray but are never part of
- * a gray list.
+ * The simplified scheme described above isn't fully accurate because of threads and upvalues.
  *
  * Threads are hard to deal with because for them to fit into the white-gray-black scheme, writes to thread stacks need to have barriers
  * that turn the thread from black (already scanned) to gray - but this is very expensive because stack writes are very common. To
@@ -139,7 +141,7 @@ LUAU_DYNAMIC_FASTFLAGVARIABLE(LuauGcTableStepFix, false)
 #define white2gray(x) reset2bits((x)->gch.marked, WHITE0BIT, WHITE1BIT)
 #define black2gray(x) resetbit((x)->gch.marked, BLACKBIT)
 
-#define stringmark(s) reset2bits((s)->marked, WHITE0BIT, WHITE1BIT)
+#define stringmark(s) (reset2bits((s)->marked, WHITE0BIT, WHITE1BIT), l_setbit((s)->marked, BLACKBIT))
 
 #define markvalue(g, o) \
     { \
@@ -246,15 +248,30 @@ static void reallymarkobject(global_State* g, GCObject* o)
     {
     case LUA_TSTRING:
     {
+        gray2black(o); // strings are never gray
         return;
     }
     case LUA_TUSERDATA:
     {
-        LuaTable* mt = gco2u(o)->metatable;
-        gray2black(o); // udata are never gray
-        if (mt)
-            markobject(g, mt);
-        return;
+        if (FFlag::LuauGcTraceUdata)
+        {
+            gray2black(o); // udata are never gray
+            Udata* u = gco2u(o);
+            if (u->tag < LUA_UTAG_LIMIT)
+                if (lua_UserdataMark markfn = g->udatamark[u->tag])
+                    markfn(g->mainthread, u->data);
+            if (LuaTable* mt = u->metatable)
+                markobject(g, mt);
+            return;
+        }
+        else
+        {
+            LuaTable* mt = gco2u(o)->metatable;
+            gray2black(o); // udata are never gray
+            if (mt)
+                markobject(g, mt);
+            return;
+        }
     }
     case LUA_TUPVAL:
     {
@@ -281,6 +298,11 @@ static void reallymarkobject(global_State* g, GCObject* o)
         gco2th(o)->gclist = g->gray;
         g->gray = o;
         break;
+    }
+    case LUA_TVECTOR:
+    {
+        gray2black(o); // vectors are never gray
+        return;
     }
     case LUA_TBUFFER:
     {
@@ -400,6 +422,12 @@ static void traverseproto(global_State* g, Proto* f)
 
     if (f->deoptimized)
         markobject(g, f->deoptimized);
+
+    if (FFlag::LuauRuntimeFeedback && g->ecb.examinefunction)
+    {
+        if ((f->execflags & PEF_EXECLOCKED) == 0)
+            g->ecb.examinefunction(g->mainthread, f);
+    }
 }
 
 static void traverseclosure(global_State* g, Closure* cl)
@@ -407,6 +435,9 @@ static void traverseclosure(global_State* g, Closure* cl)
     markobject(g, cl->env);
     if (cl->isC)
     {
+        if (TString* str = cl->c.debugname)
+            stringmark(str);
+
         int i;
         for (i = 0; i < cl->nupvalues; i++) // mark its upvalues
             markvalue(g, &cl->c.upvals[i]);
@@ -424,10 +455,16 @@ static void traverseclosure(global_State* g, Closure* cl)
 static void traversestack(global_State* g, lua_State* l)
 {
     markobject(g, l->gt);
+
     if (l->namecall)
         stringmark(l->namecall);
+
+    if (FFlag::LuauCoroutineFinally && l->finalizers)
+        markobject(g, l->finalizers);
+
     for (StkId o = l->stack; o < l->top; o++)
         markvalue(g, o);
+
     for (UpVal* uv = l->openupval; uv; uv = uv->u.open.threadnext)
     {
         LUAU_ASSERT(upisopen(uv));
@@ -439,12 +476,19 @@ static void traversestack(global_State* g, lua_State* l)
 static void traverseclass(global_State* g, LuauClass* classobject)
 {
     markobject(g, classobject->name);
+    if (classobject->super)
+        markobject(g, classobject->super);
     markobject(g, classobject->memberstooffset);
-    for (int i = 0; i < classobject->numberofallmembers; i++)
-        markobject(g, classobject->offsettomember[i]);
-    for (int i = 0; i < classobject->numberofallmembers - classobject->numberofinstancemembers; i++)
+    for (uint32_t i = 0; i < luaR_offsettomemberlength(classobject); i++)
+    {
+        if (TString* str = classobject->offsettomember[i])
+            markobject(g, str);
+    }
+    // Includes this class's private static members, which live at the tail of staticmembers.
+    for (uint32_t i = 0; i < luaR_numstaticmembers(classobject); i++)
         markvalue(g, &classobject->staticmembers[i]);
-    markobject(g, classobject->metatable);
+    if (classobject->metatable)
+        markobject(g, classobject->metatable);
     if (classobject->instancemetatable)
         markobject(g, classobject->instancemetatable);
 }
@@ -452,7 +496,7 @@ static void traverseclass(global_State* g, LuauClass* classobject)
 static void traverseobject(global_State* g, LuauObject* classinst)
 {
     markobject(g, classinst->lclass);
-    for (int i = 0; i < classinst->numberofmembers; i++)
+    for (uint32_t i = 0; i < classinst->numberofmembers; i++)
         markvalue(g, &classinst->members[i]);
 }
 
@@ -522,10 +566,7 @@ static size_t propagatemark(global_State* g)
         if (traversetable(g, h)) // table is weak?
             black2gray(o);       // keep it gray
 
-        if (DFFlag::LuauGcTableStepFix)
-            return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
-        else
-            return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * sizenode(h);
+        return sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
     }
     case LUA_TFUNCTION:
     {
@@ -580,24 +621,33 @@ static size_t propagatemark(global_State* g)
         // We've traversed the "object" itself ...
         return sizeof(LuauClass) +
                // ... plus the method closures, each a `TValue` wide ...
-               ((classobject->numberofallmembers - classobject->numberofinstancemembers) * sizeof(TValue)) +
-               // ... plus a string pointer for each method or property, each a pointer wide.
-               (classobject->numberofallmembers * sizeof(TString*));
+               (luaR_numstaticmembers(classobject) * sizeof(TValue)) +
+               // ... plus a string pointer for each method or property except for private static members, each a pointer wide.
+               (luaR_offsettomemberlength(classobject) * sizeof(TString*));
     }
     case LUA_TOBJECT:
     {
         LuauObject* classinst = gco2object(o);
         g->gray = classinst->gclist;
         traverseobject(g, classinst);
-        // We've traversed the instance ...
-        return sizeof(LuauObject) +
-               // ... plus all of the instance fields.
-               classinst->numberofmembers * sizeof(TValue);
+        // We've traversed the instance and its instance fields
+        return sizeof(LuauObject) + classinst->numberofmembers * sizeof(TValue);
     }
     default:
         LUAU_ASSERT(0);
         return 0;
     }
+}
+
+static void embeddermarkref(lua_State* L, int ref)
+{
+    LUAU_ASSERT(FFlag::LuauGcTraceUdata);
+    if (ref <= LUA_REFNIL)
+        return;
+    LuaTable* wt = hvalue(&L->global->weakregistry);
+    const TValue* slot = luaH_getnum(wt, ref);
+    if (iscollectable(slot) && iswhite(gcvalue(slot)))
+        reallymarkobject(L->global, gcvalue(slot));
 }
 
 static size_t propagateall(global_State* g)
@@ -649,6 +699,22 @@ static void tableresizeprotected(lua_State* L, LuaTable* t, int nhsize)
     LUAU_ASSERT(status == LUA_OK || status == LUA_ERRMEM);
 }
 
+static void rebuildmetacache(lua_State* L, LuaTable* h)
+{
+    uint8_t tmcache = 0;
+
+    for (int event = 0; event < TM_N; ++event)
+    {
+        const TValue* value = luaH_getstr(h, L->global->tmname[event]);
+        setobj(L, getmetacache(h, event), value);
+
+        if (event <= TM_EQ && ttisnil(value))
+            tmcache |= cast_byte(1u << event);
+    }
+
+    h->tmcache = tmcache;
+}
+
 /*
 ** clear collected entries from weaktables
 */
@@ -659,10 +725,7 @@ static size_t cleartable(lua_State* L, GCObject* l)
     {
         LuaTable* h = gco2h(l);
 
-        if (DFFlag::LuauGcTableStepFix)
-            work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
-        else
-            work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * sizenode(h);
+        work += sizeof(LuaTable) + sizeof(TValue) * h->sizearray + sizeof(LuaNode) * (h->node == &luaH_dummynode ? 0 : sizenode(h));
 
         int i = h->sizearray;
         while (i--)
@@ -693,14 +756,20 @@ static size_t cleartable(lua_State* L, GCObject* l)
             }
         }
 
-        if (const char* modev = gettablemode(L->global, h))
+        if (hasmetacache(h))
+            rebuildmetacache(L, h);
+
+        if (!h->readonly) // frozen tables do not shrink
         {
-            // are we allowed to shrink this weak table?
-            if (strchr(modev, 's'))
+            if (const char* modev = gettablemode(L->global, h))
             {
-                // shrink at 37.5% occupancy
-                if (activevalues < sizenode(h) * 3 / 8)
-                    tableresizeprotected(L, h, activevalues);
+                // are we allowed to shrink this weak table?
+                if (strchr(modev, 's'))
+                {
+                    // shrink at 37.5% occupancy
+                    if (activevalues < sizenode(h) * 3 / 8)
+                        tableresizeprotected(L, h, activevalues);
+                }
             }
         }
 
@@ -735,6 +804,9 @@ static void freeobj(lua_State* L, GCObject* o, lua_Page* page)
     case LUA_TUSERDATA:
         luaU_freeudata(L, gco2u(o), page);
         break;
+    case LUA_TVECTOR:
+        luaVec_freevector(L, gco2vec(o), page);
+        break;
     case LUA_TBUFFER:
         luaB_freebuffer(L, gco2buf(o), page);
         break;
@@ -747,6 +819,21 @@ static void freeobj(lua_State* L, GCObject* o, lua_Page* page)
     default:
         LUAU_ASSERT(0);
     }
+}
+
+template<int Type>
+static void freeobjtagged(lua_State* L, GCObject* o, lua_Page* page);
+
+template<>
+void freeobjtagged<LUA_TBUFFER>(lua_State* L, GCObject* o, lua_Page* page)
+{
+    luaB_freebuffer(L, gco2buf(o), page);
+}
+
+template<>
+void freeobjtagged<-1>(lua_State* L, GCObject* o, lua_Page* page)
+{
+    freeobj(L, o, page);
 }
 
 static void stringresizeprotected(lua_State* L, int newsize)
@@ -808,9 +895,20 @@ void luaC_freeall(lua_State* L)
     LUAU_ASSERT(L->global->strt.nuse == 0);
 }
 
+static void markudatadirectaccess(global_State* g)
+{
+    for (int i = 0; i < UTAG_INTERNAL_LIMIT; i++)
+    {
+        lua_UdataDirectAccessData& udatadirect = g->udatadirect[i];
+
+        markvalue(g, &udatadirect.indextm);
+        markvalue(g, &udatadirect.newindextm);
+        markvalue(g, &udatadirect.namecalltm);
+    }
+}
+
 static void markudatadirectfields(global_State* g)
 {
-    LUAU_ASSERT(FFlag::LuauDirectFieldGet);
     for (int i = 0; i < UTAG_INTERNAL_LIMIT; i++)
         if (g->udatadirectfields[i])
             markobject(g, g->udatadirectfields[i]);
@@ -833,6 +931,15 @@ static void marktaggetmt(global_State* g)
     }
 }
 
+static void markfastpcalls(global_State* g)
+{
+    if (g->builtinPcall)
+        markobject(g, g->builtinPcall);
+
+    if (g->builtinXpcall)
+        markobject(g, g->builtinXpcall);
+}
+
 // mark root set
 static void markroot(lua_State* L)
 {
@@ -844,26 +951,23 @@ static void markroot(lua_State* L)
     // make global table be traversed before main stack
     markobject(g, g->mainthread->gt);
     markvalue(g, registry(L));
-
-    if (FFlag::LuauUdataDirectAccess6)
+    if (FFlag::LuauGcTraceUdata)
     {
-        for (int i = 0; i < UTAG_INTERNAL_LIMIT; i++)
-        {
-            lua_UdataDirectAccessData& udatadirect = L->global->udatadirect[i];
-
-            markvalue(g, &udatadirect.indextm);
-            markvalue(g, &udatadirect.newindextm);
-            markvalue(g, &udatadirect.namecalltm);
-        }
+        markvalue(g, &g->weakregistry);
+        if (g->embeddergc)
+            g->embeddergc(g->mainthread, nullptr);
     }
 
-    if (FFlag::LuauDirectFieldGet)
-        markudatadirectfields(g);
+    markudatadirectaccess(g);
+
+    markudatadirectfields(g);
+
+    if (FFlag::LuauFastpcall)
+        markfastpcalls(g);
 
     markmt(g);
 
-    if (FFlag::LuauUdataMetatablePinned)
-        marktaggetmt(g);
+    marktaggetmt(g);
 
     g->gcstate = GCSpropagate;
 }
@@ -949,11 +1053,14 @@ static size_t atomic(lua_State* L)
     markobject(g, L); // mark running thread
     markmt(g);        // mark basic metatables (again)
 
-    if (FFlag::LuauUdataMetatablePinned)
-        marktaggetmt(g); // mark tagged userdata metatables (again)
+    marktaggetmt(g); // mark tagged userdata metatables (again)
 
-    if (FFlag::LuauDirectFieldGet)
-        markudatadirectfields(g); // mark direct field dispatch tables (again)
+    markudatadirectaccess(g); // mark tagged userdata direct access functions (again)
+
+    markudatadirectfields(g); // mark direct field dispatch tables (again)
+
+    if (FFlag::LuauFastpcall)
+        markfastpcalls(g);
 
     work += propagateall(g);
 
@@ -968,6 +1075,20 @@ static size_t atomic(lua_State* L)
 
 #ifdef LUAI_GCMETRICS
     g->gcmetrics.currcycle.atomictimegray += recordGcDeltaTime(currts);
+#endif
+
+    // fixed-point algorithm for embedder references
+    if (FFlag::LuauGcTraceUdata && g->embeddergc)
+    {
+        while (g->embeddergc(g->mainthread, embeddermarkref) != 0)
+        {
+            work += propagateall(g);
+        }
+    }
+
+#ifdef LUAI_GCMETRICS
+    if (FFlag::LuauGcTraceUdata)
+        g->gcmetrics.currcycle.atomictimeembedder += recordGcDeltaTime(currts);
 #endif
 
     // remove collected objects from weak tables
@@ -988,12 +1109,23 @@ static size_t atomic(lua_State* L)
     // flip current white
     g->currentwhite = cast_byte(otherwhite(g));
     g->sweepgcopage = g->allgcopages;
+    g->sweepgcopage_cage = g->allgcopages_cage;
+
+    if (FFlag::LuauBufferSweep)
+    {
+        g->sweeppageset = 0;
+
+        for (int i = 0; i < TAGGED_PAGESET_SIZE; i++)
+            g->taggedpageset[i].sweeppage = g->taggedpageset[i].allpages;
+    }
+
     g->gcstate = GCSsweep;
 
     return work;
 }
 
 // a version of generic luaM_visitpage specialized for the main sweep stage
+template<int Type = -1>
 static int sweepgcopage(lua_State* L, lua_Page* page)
 {
     char* start;
@@ -1029,7 +1161,18 @@ static int sweepgcopage(lua_State* L, lua_Page* page)
         else
         {
             LUAU_ASSERT(isdead(g, gco));
-            freeobj(L, gco, page);
+
+            if (FFlag::LuauBufferSweep)
+            {
+                if (Type == -1)
+                    freeobj(L, gco, page);
+                else
+                    freeobjtagged<Type>(L, gco, page);
+            }
+            else
+            {
+                freeobj(L, gco, page);
+            }
 
             // if the last block was removed, page would be removed as well
             if (--busyBlocks == 0)
@@ -1038,6 +1181,34 @@ static int sweepgcopage(lua_State* L, lua_Page* page)
     }
 
     return int(end - start) / blockSize;
+}
+
+static size_t sweeppageset(lua_State* L, lua_Page*& pageset, size_t cost, size_t limit, int type)
+{
+    while (pageset && cost < limit)
+    {
+        lua_Page* next = luaM_getnextpage(pageset); // page sweep might destroy the page
+
+        int steps = 0;
+
+        switch (type)
+        {
+        case -1:
+            steps = sweepgcopage<-1>(L, pageset);
+            break;
+        case LUA_TBUFFER:
+            steps = sweepgcopage<LUA_TBUFFER>(L, pageset);
+            break;
+        default:
+            LUAU_ASSERT(!"unexpected sweep pageset type");
+            break;
+        }
+
+        pageset = next;
+        cost += static_cast<size_t>(steps * GC_SWEEPPAGESTEPCOST);
+    }
+
+    return cost;
 }
 
 static size_t gcstep(lua_State* L, size_t limit)
@@ -1108,26 +1279,75 @@ static size_t gcstep(lua_State* L, size_t limit)
     }
     case GCSsweep:
     {
-        while (g->sweepgcopage && cost < limit)
+        if (FFlag::LuauBufferSweep)
         {
-            lua_Page* next = luaM_getnextpage(g->sweepgcopage); // page sweep might destroy the page
+            bool done = false;
 
-            int steps = sweepgcopage(L, g->sweepgcopage);
+            while (cost < limit && !done)
+            {
+                if (g->sweepgcopage)
+                    cost = sweeppageset(L, g->sweepgcopage, cost, limit, -1);
+                else if (g->sweepgcopage_cage)
+                    cost = sweeppageset(L, g->sweepgcopage_cage, cost, limit, -1);
+                else if (g->sweeppageset < TAGGED_PAGESET_SIZE && g->taggedpageset[g->sweeppageset].sweeppage)
+                    cost = sweeppageset(L, g->taggedpageset[g->sweeppageset].sweeppage, cost, limit, g->sweeppageset + TAGGED_PAGESET_BASE);
+                else if (g->sweeppageset < TAGGED_PAGESET_SIZE)
+                    g->sweeppageset++;
+                else
+                    done = true;
+            }
 
-            g->sweepgcopage = next;
-            cost += steps * GC_SWEEPPAGESTEPCOST;
+            // nothing more to sweep?
+            if (done)
+            {
+                // don't forget to visit main thread, it's the only object not allocated in GCO pages
+                LUAU_ASSERT(!isdead(g, obj2gco(g->mainthread)));
+                makewhite(g, obj2gco(g->mainthread)); // make it white (for next cycle)
+
+                shrinkbuffers(L);
+
+                g->gcstate = GCSpause; // end collection
+
+                if (FFlag::LuauRuntimeFeedback && g->ecb.commitfunctions)
+                    g->ecb.commitfunctions(g->mainthread);
+            }
         }
-
-        // nothing more to sweep?
-        if (g->sweepgcopage == NULL)
+        else
         {
-            // don't forget to visit main thread, it's the only object not allocated in GCO pages
-            LUAU_ASSERT(!isdead(g, obj2gco(g->mainthread)));
-            makewhite(g, obj2gco(g->mainthread)); // make it white (for next cycle)
+            while (g->sweepgcopage && cost < limit)
+            {
+                lua_Page* next = luaM_getnextpage(g->sweepgcopage); // page sweep might destroy the page
 
-            shrinkbuffers(L);
+                int steps = sweepgcopage(L, g->sweepgcopage);
 
-            g->gcstate = GCSpause; // end collection
+                g->sweepgcopage = next;
+                cost += static_cast<size_t>(steps * GC_SWEEPPAGESTEPCOST);
+            }
+
+            while (g->sweepgcopage_cage && cost < limit)
+            {
+                lua_Page* next = luaM_getnextpage(g->sweepgcopage_cage); // page sweep might destroy the page
+
+                int steps = sweepgcopage(L, g->sweepgcopage_cage);
+
+                g->sweepgcopage_cage = next;
+                cost += static_cast<size_t>(steps * GC_SWEEPPAGESTEPCOST);
+            }
+
+            // nothing more to sweep?
+            if (g->sweepgcopage == NULL && g->sweepgcopage_cage == NULL)
+            {
+                // don't forget to visit main thread, it's the only object not allocated in GCO pages
+                LUAU_ASSERT(!isdead(g, obj2gco(g->mainthread)));
+                makewhite(g, obj2gco(g->mainthread)); // make it white (for next cycle)
+
+                shrinkbuffers(L);
+
+                g->gcstate = GCSpause; // end collection
+
+                if (FFlag::LuauRuntimeFeedback && g->ecb.commitfunctions)
+                    g->ecb.commitfunctions(g->mainthread);
+            }
         }
         break;
     }
@@ -1169,6 +1389,12 @@ static int64_t getheaptriggererroroffset(global_State* g)
     return int64_t(totalTerm * 1024);
 }
 
+// the heap can shrink between measurements (after a full collection, or when thread stacks are shrunk during marking), which counts as no growth
+static size_t getheapgrowth(size_t current, size_t previous)
+{
+    return current > previous ? current - previous : 0;
+}
+
 static size_t getheaptrigger(global_State* g, size_t heapgoal)
 {
     // adjust threshold based on a guess of how many bytes will be allocated between the cycle start and sweep phase
@@ -1180,7 +1406,11 @@ static size_t getheaptrigger(global_State* g, size_t heapgoal)
     if (allocationduration < durationthreshold)
         return heapgoal;
 
-    double allocationrate = (g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / allocationduration;
+    double allocationrate;
+    if (DFFlag::LuauGcHeapShrinkFix)
+        allocationrate = getheapgrowth(g->gcstats.atomicstarttotalsizebytes, g->gcstats.endtotalsizebytes) / allocationduration;
+    else
+        allocationrate = (g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / allocationduration;
     double markduration = g->gcstats.atomicstarttimestamp - g->gcstats.starttimestamp;
 
     int64_t expectedgrowth = int64_t(markduration * allocationrate);
@@ -1195,7 +1425,10 @@ size_t luaC_step(lua_State* L, bool assist)
 {
     global_State* g = L->global;
 
-    int lim = g->gcstepsize * g->gcstepmul / 100; // how much to work
+    if (g->gcdisabled != 0)
+        return 0;
+
+    size_t lim = g->gcstepsize * g->gcstepmul / 100; // how much to work
     LUAU_ASSERT(g->totalbytes >= g->GCthreshold);
     size_t debt = g->totalbytes - g->GCthreshold;
 
@@ -1211,6 +1444,15 @@ size_t luaC_step(lua_State* L, bool assist)
 
     double lasttimestamp = lua_clock();
 #endif
+
+    // if allocations outpace the GC to require an assist, adjust step size to cover the difference
+    if (assist)
+    {
+        size_t need = debt * g->gcstepmul / 100;
+
+        if (need > lim)
+            lim = need;
+    }
 
     int lastgcstate = g->gcstate;
 
@@ -1266,6 +1508,16 @@ void luaC_fullgc(lua_State* L)
     {
         // reset sweep marks to sweep all elements (returning them to white)
         g->sweepgcopage = g->allgcopages;
+        g->sweepgcopage_cage = g->allgcopages_cage;
+
+        if (FFlag::LuauBufferSweep)
+        {
+            g->sweeppageset = 0;
+
+            for (int i = 0; i < TAGGED_PAGESET_SIZE; i++)
+                g->taggedpageset[i].sweeppage = g->taggedpageset[i].allpages;
+        }
+
         // reset other collector lists
         g->gray = NULL;
         g->grayagain = NULL;
@@ -1315,6 +1567,13 @@ void luaC_fullgc(lua_State* L)
         g->GCthreshold = g->totalbytes;
 
     g->gcstats.heapgoalsizebytes = heapgoalsizebytes;
+
+    if (DFFlag::LuauGcHeapShrinkFix)
+    {
+        // full collection ends a cycle, so the heap growth is measured from this point
+        g->gcstats.endtimestamp = lua_clock();
+        g->gcstats.endtotalsizebytes = g->totalbytes;
+    }
 
 #ifdef LUAI_GCMETRICS
     finishGcCycleMetrics(g);
@@ -1400,6 +1659,9 @@ int64_t luaC_allocationrate(lua_State* L)
         if (duration < durationthreshold)
             return -1;
 
+        if (DFFlag::LuauGcHeapShrinkFix)
+            return int64_t(getheapgrowth(g->totalbytes, g->gcstats.endtotalsizebytes) / duration);
+
         return int64_t((g->totalbytes - g->gcstats.endtotalsizebytes) / duration);
     }
 
@@ -1408,6 +1670,9 @@ int64_t luaC_allocationrate(lua_State* L)
 
     if (duration < durationthreshold)
         return -1;
+
+    if (DFFlag::LuauGcHeapShrinkFix)
+        return int64_t(getheapgrowth(g->gcstats.atomicstarttotalsizebytes, g->gcstats.endtotalsizebytes) / duration);
 
     return int64_t((g->gcstats.atomicstarttotalsizebytes - g->gcstats.endtotalsizebytes) / duration);
 }

@@ -122,8 +122,24 @@ private:
     // if exp then block {elseif exp then block} [else block] end
     AstStat* parseIf();
 
+    // (`if' | `elseif') (`local' | `const') binding `=' exp then block ... end -- parses an entire `if local`/`if const`
+    AstStat* parseIfLocalCondition(const Location& start);
+
+    // Parse the trailing `{elseif exp then block} [else block] end` shared by `parseIf` and `parseIfLocalCondition`
+    AstStat* parseElseBody(
+        const Location& start,
+        const Lexeme& matchThen,
+        AstStatBlock* thenbody,
+        Location& end,
+        std::optional<Location>& elseLocation
+    );
+
     // while exp do block end
     AstStat* parseWhile();
+
+    // while `local' binding `=' exp do block end -- parses an entire `while local`.
+    // `start` is the location of the already-consumed `while` keyword; the current lexeme is `local`.
+    AstStat* parseWhileLocalCondition(const Location& start);
 
     // repeat block until exp
     AstStat* parseRepeat();
@@ -164,7 +180,6 @@ private:
     void parseAttrList(TempVector<AstAttr*>& attributes, TempVector<CstAttrList*>* cstAttrLists);
 
     // attribute ::= '@' NAME | attrlist
-    void parseAttribute_DEPRECATED(TempVector<AstAttr*>& attribute); // TODO: Clip with LuauCstAttr
     void parseAttribute(TempVector<AstAttr*>& attribute);
 
     // attributes ::= {attribute}
@@ -192,7 +207,7 @@ private:
     // type Name `=' Type
     AstStat* parseTypeAlias(const Location& start, bool exported, Position typeKeywordPosition);
 
-    AstStat* parseClassStat(const Location& start, bool exported);
+    AstStat* parseClassStat(const Location& start, bool exported, bool open);
 
     // type function Name ... end
     AstStat* parseTypeFunction(const Location& start, bool exported, Position typeKeywordPosition);
@@ -356,6 +371,12 @@ private:
     // TODO: Add grammar rules here?
     AstExpr* parseIfElseExpr();
 
+    // (`if' | `elseif') (`local' | `const') binding `=' exp then exp ... else exp -- parses an entire `if local`/`if const` expression
+    AstExpr* parseIfElseExprLocalCondition(const Location& start);
+
+    // Parse the trailing `else exp` / `elseif ...` shared by `parseIfElseExpr` and `parseIfElseExprLocalCondition`
+    AstExpr* parseIfElseExprTail(bool& hasElse, bool& isElseIf);
+
     // stringinterp ::= <INTERP_BEGIN> exp {<INTERP_MID> exp} <INTERP_END>
     AstExpr* parseInterpString();
 
@@ -363,6 +384,8 @@ private:
     AstArray<AstTypeOrPack> parseTypeInstantiationExpr(CstTypeInstantiation* cstNodeOut = nullptr, Location* endLocationOut = nullptr);
 
     AstExpr* parseExplicitTypeInstantiationExpr(Position start, AstExpr& basedOnExpr);
+
+    AstExpr* parseClassRefExpr();
 
     // Name
     std::optional<Name> parseNameOpt(const char* context = nullptr);
@@ -540,9 +563,13 @@ private:
     std::vector<Function> functionStack;
     size_t typeFunctionDepth = 0;
 
+    // True while parsing the body of a class method, which is the only context where `._x` / `:_x` denotes a private member access. Set exclusively
+    // by parseClassStat.
+    bool inClassMethodBody = false;
+
     DenseHashMap<AstName, AstLocal*> localMap;
     std::vector<AstLocal*> localStack;
-    DenseHashSet<AstName> classesWithinModule{{}};
+    DenseHashSet<AstName> classesWithinModule;
 
     std::vector<ParseError> parseErrors;
 

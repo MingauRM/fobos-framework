@@ -3,6 +3,7 @@
 #include "Luau/TableLiteralInference.h"
 
 #include "Luau/Ast.h"
+#include "Luau/BuiltinDefinitions.h"
 #include "Luau/Common.h"
 #include "Luau/ConstraintSolver.h"
 #include "Luau/HashUtil.h"
@@ -14,9 +15,9 @@
 #include "Luau/TypeUtils.h"
 #include "Luau/Unifier2.h"
 
-LUAU_FASTFLAGVARIABLE(LuauBidirectionalInferenceVariadics)
+#include <stdlib.h>
+
 LUAU_FASTFLAGVARIABLE(LuauBidirectionalInferenceBetterLambdaHandling)
-LUAU_FASTFLAG(LuauBidirectionalInferenceSimplifyTables)
 
 namespace Luau
 {
@@ -78,8 +79,8 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
                 return false;
             }
 
-            int candidateDistance = std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters);
-            int thisDistance = std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters);
+            int candidateDistance = abs(int(size(candidate->argTypes)) - numberOfLambdaParameters);
+            int thisDistance = abs(int(size(ftv.argTypes)) - numberOfLambdaParameters);
 
             if (thisDistance < candidateDistance)
             {
@@ -90,12 +91,11 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
             {
                 ambiguous = true;
             }
-
         }
         else
         {
             if (candidate == nullptr ||
-                std::abs(int(size(candidate->argTypes)) - numberOfLambdaParameters) > std::abs(int(size(ftv.argTypes)) - numberOfLambdaParameters))
+                abs(int(size(candidate->argTypes)) - numberOfLambdaParameters) > abs(int(size(ftv.argTypes)) - numberOfLambdaParameters))
             {
                 candidate = get<FunctionType>(ty);
                 return false;
@@ -104,6 +104,19 @@ struct FindFunctionTypeIn : IterativeTypeVisitor
         return false;
     }
 };
+
+/**
+ * Is this an expression that we can check has an expected type, for now this
+ * is limited to literals (including lambdas, "function literals"), groups
+ * (parenthesized expressions), and if-else expressions.
+ */
+bool isCheckableExpr(const AstExpr* expr)
+{
+    if (const AstExprCall* call = expr->as<AstExprCall>(); call && matchSetMetatable(*call))
+        return true;
+
+    return isLiteral(expr) || expr->is<AstExprGroup>() || expr->is<AstExprIfElse>();
+}
 
 struct BidirectionalTypePusher
 {
@@ -119,7 +132,7 @@ struct BidirectionalTypePusher
 
     std::vector<IncompleteInference> incompleteInferences;
 
-    DenseHashSet<std::pair<TypeId, const AstExpr*>, PairHash<TypeId, const AstExpr*>> seen{{nullptr, nullptr}};
+    DenseHashSet<std::pair<TypeId, const AstExpr*>, PairHash<TypeId, const AstExpr*>> seen;
 
     BidirectionalTypePusher(
         NotNull<DenseHashMap<const AstExpr*, TypeId>> astTypes,
@@ -157,6 +170,14 @@ struct BidirectionalTypePusher
 
         expectedType = follow(expectedType);
         exprType = follow(exprType);
+
+        if (!isCheckableExpr(expr))
+        {
+            // NOTE: For now we aren't using the result of this function, so
+            // just return the original expression type.
+            return exprType;
+        }
+
 
         // NOTE: We cannot block on free types here, as that trivially means
         // any recursive function would have a cycle, consider:
@@ -196,10 +217,16 @@ struct BidirectionalTypePusher
             return exprType;
         }
 
-        if (!isLiteral(expr))
-            // NOTE: For now we aren't using the result of this function, so
-            // just return the original expression type.
+        if (const AstExprCall* call = expr->as<AstExprCall>(); call && matchSetMetatable(*call))
+        {
+            if (const MetatableType* expectedMetatable = get<MetatableType>(expectedType))
+            {
+                pushType(expectedMetatable->table, call->args.data[0]);
+                pushType(expectedMetatable->metatable, call->args.data[1]);
+            }
+
             return exprType;
+        }
 
         if (expr->is<AstExprConstantString>() || expr->is<AstExprConstantNumber>() || expr->is<AstExprConstantBool>() ||
             expr->is<AstExprConstantNil>())
@@ -252,35 +279,18 @@ struct BidirectionalTypePusher
 
             if (lambdaTy && expectedLambdaTy)
             {
-                if (FFlag::LuauBidirectionalInferenceVariadics)
+                const auto& [lambdaArgTys, _lambdaTail] = flatten(lambdaTy->argTypes);
+                const auto& [expectedLambdaArgTys, _expectedLambdaTail] =
+                    extendTypePack(*solver->arena, solver->builtinTypes, expectedLambdaTy->argTypes, exprLambda->args.size);
+
+                auto limit = std::min({lambdaArgTys.size(), expectedLambdaArgTys.size(), exprLambda->args.size});
+                for (size_t argIndex = 0; argIndex < limit; argIndex++)
                 {
-                    const auto& [lambdaArgTys, _lambdaTail] = flatten(lambdaTy->argTypes);
-                    const auto& [expectedLambdaArgTys, _expectedLambdaTail] =
-                        extendTypePack(*solver->arena, solver->builtinTypes, expectedLambdaTy->argTypes, exprLambda->args.size);
-
-                    auto limit = std::min({lambdaArgTys.size(), expectedLambdaArgTys.size(), exprLambda->args.size});
-                    for (size_t argIndex = 0; argIndex < limit; argIndex++)
-                    {
-                        if (!exprLambda->args.data[argIndex]->annotation && get<FreeType>(follow(lambdaArgTys[argIndex])) &&
-                            !containsGeneric(expectedLambdaArgTys[argIndex], NotNull{genericTypesAndPacks}))
-                            solver->bind(NotNull{constraint}, lambdaArgTys[argIndex], expectedLambdaArgTys[argIndex]);
-                    }
-
+                    if (!exprLambda->args.data[argIndex]->annotation && get<FreeType>(follow(lambdaArgTys[argIndex])) &&
+                        !containsGeneric(expectedLambdaArgTys[argIndex], NotNull{genericTypesAndPacks}))
+                        solver->bind(NotNull{constraint}, lambdaArgTys[argIndex], expectedLambdaArgTys[argIndex]);
                 }
-                else
-                {
 
-                    const auto& [lambdaArgTys, _lambdaTail] = flatten(lambdaTy->argTypes);
-                    const auto& [expectedLambdaArgTys, _expectedLambdaTail] = flatten(expectedLambdaTy->argTypes);
-
-                    auto limit = std::min({lambdaArgTys.size(), expectedLambdaArgTys.size(), exprLambda->args.size});
-                    for (size_t argIndex = 0; argIndex < limit; argIndex++)
-                    {
-                        if (!exprLambda->args.data[argIndex]->annotation && get<FreeType>(follow(lambdaArgTys[argIndex])) &&
-                            !containsGeneric(expectedLambdaArgTys[argIndex], NotNull{genericTypesAndPacks}))
-                            solver->bind(NotNull{constraint}, lambdaArgTys[argIndex], expectedLambdaArgTys[argIndex]);
-                    }
-                }
 
                 if (FFlag::LuauBidirectionalInferenceBetterLambdaHandling)
                 {
@@ -311,16 +321,8 @@ struct BidirectionalTypePusher
             {
                 if (auto utv = get<UnionType>(expectedType))
                 {
-                    if (FFlag::LuauBidirectionalInferenceSimplifyTables)
-                    {
-                        if (auto tt = extractMatchingTableType(utv, exprType, solver->builtinTypes, solver->arena))
-                            (void)pushType(*tt, expr);
-                    }
-                    else
-                    {
-                        if (auto tt = extractMatchingTableType_DEPRECATED(utv, exprType, solver->builtinTypes))
-                            (void)pushType(*tt, expr);
-                    }
+                    if (auto tt = extractMatchingTableType(utv, exprType, solver->builtinTypes, solver->arena))
+                        (void)pushType(*tt, expr);
                 }
                 else if (auto itv = get<IntersectionType>(expectedType))
                 {

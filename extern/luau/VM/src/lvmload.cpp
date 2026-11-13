@@ -8,6 +8,7 @@
 #include "lfunc.h"
 #include "lobject.h"
 #include "lstring.h"
+#include "lvector.h"
 
 #include "lgc.h"
 #include "lmem.h"
@@ -16,9 +17,9 @@
 
 #include <string.h>
 
-LUAU_FASTFLAGVARIABLE(LuauUdataDirectAccess6)
-LUAU_FASTFLAG(LuauCallFeedback)
 LUAU_FASTFLAGVARIABLE(LuauCostModel)
+LUAU_FASTFLAGVARIABLE(LuauLoadRemapOptionalUserdata)
+LUAU_FASTFLAGVARIABLE(LuauLoadExplicitGcDisable)
 
 template<typename T>
 struct TempBuffer
@@ -61,30 +62,42 @@ struct TempBuffer
     }
 };
 
-struct ScopedSetGCThreshold
+struct ScopedDisableGC
 {
 public:
-    ScopedSetGCThreshold(global_State* global, size_t newThreshold) noexcept
+    ScopedDisableGC(global_State* global, size_t newThreshold_DEPRECATED) noexcept
         : global{global}
     {
-        originalThreshold = global->GCthreshold;
-        global->GCthreshold = newThreshold;
+        if (FFlag::LuauLoadExplicitGcDisable)
+        {
+            originalGcDisabled = global->gcdisabled;
+            global->gcdisabled = 1;
+        }
+        else
+        {
+            originalThreshold_DEPRECATED = global->GCthreshold;
+            global->GCthreshold = newThreshold_DEPRECATED;
+        }
     }
 
-    ScopedSetGCThreshold(const ScopedSetGCThreshold&) = delete;
-    ScopedSetGCThreshold(ScopedSetGCThreshold&&) = delete;
+    ScopedDisableGC(const ScopedDisableGC&) = delete;
+    ScopedDisableGC(ScopedDisableGC&&) = delete;
 
-    ScopedSetGCThreshold& operator=(const ScopedSetGCThreshold&) = delete;
-    ScopedSetGCThreshold& operator=(ScopedSetGCThreshold&&) = delete;
+    ScopedDisableGC& operator=(const ScopedDisableGC&) = delete;
+    ScopedDisableGC& operator=(ScopedDisableGC&&) = delete;
 
-    ~ScopedSetGCThreshold() noexcept
+    ~ScopedDisableGC() noexcept
     {
-        global->GCthreshold = originalThreshold;
+        if (FFlag::LuauLoadExplicitGcDisable)
+            global->gcdisabled = originalGcDisabled;
+        else
+            global->GCthreshold = originalThreshold_DEPRECATED;
     }
 
 private:
     global_State* global = nullptr;
-    size_t originalThreshold = 0;
+    size_t originalThreshold_DEPRECATED = 0;
+    uint8_t originalGcDisabled = 0;
 };
 
 void luaV_getimport(lua_State* L, LuaTable* env, TValue* k, StkId res, uint32_t id, bool propagatenil)
@@ -217,6 +230,19 @@ static void resolveImportSafe(lua_State* L, LuaTable* env, TValue* k, uint32_t i
     }
 }
 
+static uint8_t remapUserdataType(uint8_t type, uint8_t* userdataRemapping, uint32_t count)
+{
+    LUAU_ASSERT(FFlag::LuauLoadRemapOptionalUserdata);
+    uint8_t tag = type & ~LBC_TYPE_OPTIONAL_BIT;
+    uint8_t optional = type & LBC_TYPE_OPTIONAL_BIT;
+    uint32_t index = uint32_t(tag - LBC_TYPE_TAGGED_USERDATA_BASE);
+
+    if (index < count)
+        return userdataRemapping[index] | optional;
+
+    return type;
+}
+
 static void remapUserdataTypes(char* data, size_t size, uint8_t* userdataRemapping, uint32_t count)
 {
     size_t offset = 0;
@@ -232,10 +258,17 @@ static void remapUserdataTypes(char* data, size_t size, uint8_t* userdataRemappi
         // Skip two bytes of function type introduction
         for (uint32_t i = 2; i < typeSize; i++)
         {
-            uint32_t index = uint32_t(types[i] - LBC_TYPE_TAGGED_USERDATA_BASE);
+            if (FFlag::LuauLoadRemapOptionalUserdata)
+            {
+                types[i] = remapUserdataType(types[i], userdataRemapping, count);
+            }
+            else
+            {
+                uint32_t index = uint32_t(types[i] - LBC_TYPE_TAGGED_USERDATA_BASE);
 
-            if (index < count)
-                types[i] = userdataRemapping[index];
+                if (index < count)
+                    types[i] = userdataRemapping[index];
+            }
         }
 
         offset += typeSize;
@@ -247,10 +280,17 @@ static void remapUserdataTypes(char* data, size_t size, uint8_t* userdataRemappi
 
         for (uint32_t i = 0; i < upvalCount; i++)
         {
-            uint32_t index = uint32_t(types[i] - LBC_TYPE_TAGGED_USERDATA_BASE);
+            if (FFlag::LuauLoadRemapOptionalUserdata)
+            {
+                types[i] = remapUserdataType(types[i], userdataRemapping, count);
+            }
+            else
+            {
+                uint32_t index = uint32_t(types[i] - LBC_TYPE_TAGGED_USERDATA_BASE);
 
-            if (index < count)
-                types[i] = userdataRemapping[index];
+                if (index < count)
+                    types[i] = userdataRemapping[index];
+            }
         }
 
         offset += upvalCount;
@@ -260,10 +300,17 @@ static void remapUserdataTypes(char* data, size_t size, uint8_t* userdataRemappi
     {
         for (uint32_t i = 0; i < localCount; i++)
         {
-            uint32_t index = uint32_t(data[offset] - LBC_TYPE_TAGGED_USERDATA_BASE);
+            if (FFlag::LuauLoadRemapOptionalUserdata)
+            {
+                data[offset] = char(remapUserdataType(uint8_t(data[offset]), userdataRemapping, count));
+            }
+            else
+            {
+                uint32_t index = uint32_t(data[offset] - LBC_TYPE_TAGGED_USERDATA_BASE);
 
-            if (index < count)
-                data[offset] = userdataRemapping[index];
+                if (index < count)
+                    data[offset] = userdataRemapping[index];
+            }
 
             offset += 2;
             readVarInt(data, size, offset);
@@ -288,7 +335,6 @@ static int loadsafe(
 
     uint8_t version = read<uint8_t>(data, size, offset);
 
-
     // 0 means the rest of the bytecode is the error message
     if (version == 0)
     {
@@ -298,7 +344,7 @@ static int loadsafe(
         return 1;
     }
 
-    if (version < LBC_VERSION_MIN || version > LBC_VERSION_MAX)
+    if ((version < LBC_VERSION_MIN || version > LBC_VERSION_MAX) && version != LBC_VERSION_CLASSES)
     {
         char chunkbuf[LUA_IDSIZE];
         const char* chunkid = luaO_chunkid(chunkbuf, sizeof(chunkbuf), chunkname, strlen(chunkname));
@@ -497,7 +543,18 @@ static int loadsafe(
                 float z = read<float>(data, size, offset);
                 float w = read<float>(data, size, offset);
                 (void)w;
-                setvvalue(&p->k[j], x, y, z, w);
+                setvvalue(L, &p->k[j], x, y, z, w);
+                break;
+            }
+
+            case LBC_CONSTANT_VECTORD:
+            {
+                double x = read<double>(data, size, offset);
+                double y = read<double>(data, size, offset);
+                double z = read<double>(data, size, offset);
+                double w = read<double>(data, size, offset);
+                (void)w;
+                setvvalue(L, &p->k[j], x, y, z, w);
                 break;
             }
 
@@ -587,13 +644,30 @@ static int loadsafe(
                 uint32_t cnid = readVarInt(data, size, offset);
                 TValue* classname = &p->k[cnid];
                 LUAU_ASSERT(ttisstring(classname));
+                uint8_t numPrivateFields = read<uint8_t>(data, size, offset);
+                uint8_t numPrivateMethods = read<uint8_t>(data, size, offset);
                 uint32_t numProperties = readVarInt(data, size, offset);
                 uint32_t numMethods = readVarInt(data, size, offset);
                 uint32_t numMembers = numMethods + numProperties;
-                TString** offsetToMember = luaM_newarray(L, numMembers, TString*, L->activememcat);
-                LuaTable* membersToOffset = luaH_new(L, 0, numMembers);
+                uint32_t membersWithoutPrivateMethods = numMembers - static_cast<uint32_t>(numPrivateMethods);
+                TString** offsetToMember = luaM_newarray(L, membersWithoutPrivateMethods, TString*, L->activememcat);
+                memset(offsetToMember, 0, membersWithoutPrivateMethods * sizeof(TString*));
+                LuaTable* membersToOffset = luaH_new(L, 0, membersWithoutPrivateMethods - static_cast<uint32_t>(numPrivateFields));
 
-                for (uint32_t idx = 0; idx < numMembers; idx++)
+                uint32_t idx = 0;
+                // Set public field names
+                for (; idx < numProperties - static_cast<uint32_t>(numPrivateFields); idx++)
+                {
+                    uint32_t mid = readVarInt(data, size, offset);
+                    TValue* memberName = &p->k[mid];
+                    LUAU_ASSERT(ttisstring(memberName));
+                    offsetToMember[idx] = tsvalue(memberName);
+                    TValue* val = luaH_setstr(L, membersToOffset, tsvalue(memberName));
+                    setnvalue(val, idx);
+                }
+
+                // Set public method names
+                for (idx = numProperties; idx < membersWithoutPrivateMethods; idx++)
                 {
                     uint32_t mid = readVarInt(data, size, offset);
                     TValue* memberName = &p->k[mid];
@@ -605,7 +679,9 @@ static int loadsafe(
 
                 membersToOffset->readonly = true;
 
-                LuauClass* lco = luaR_newclass(L, tsvalue(classname), membersToOffset, offsetToMember, numProperties, numMethods);
+                LuauClass* lco = luaR_newclass(
+                    L, tsvalue(classname), membersToOffset, offsetToMember, numProperties, numMethods, numPrivateFields, numPrivateMethods, envt
+                );
                 setclassvalue(L, &p->k[j], lco);
                 break;
             }
@@ -623,46 +699,43 @@ static int loadsafe(
             }
         }
 
-        if (FFlag::LuauUdataDirectAccess6)
+        for (Instruction* instruction = p->code; instruction < p->code + p->sizecode;)
         {
-            for (Instruction* instruction = p->code; instruction < p->code + p->sizecode;)
+            int targetOp = -1;
+
+            switch (LUAU_INSN_OP(*instruction))
             {
-                int targetOp = -1;
+            case LOP_GETTABLEKS:
+                targetOp = LOP_GETUDATAKS;
+                break;
 
-                switch (LUAU_INSN_OP(*instruction))
-                {
-                case LOP_GETTABLEKS:
-                    targetOp = LOP_GETUDATAKS;
-                    break;
+            case LOP_SETTABLEKS:
+                targetOp = LOP_SETUDATAKS;
+                break;
 
-                case LOP_SETTABLEKS:
-                    targetOp = LOP_SETUDATAKS;
-                    break;
-
-                case LOP_NAMECALL:
-                    targetOp = LOP_NAMECALLUDATA;
-                    break;
-                }
-
-                if (targetOp != -1)
-                {
-                    LUAU_ASSERT(instruction[1] < uint32_t(sizek));
-
-                    // We take over the upper 16 bits of AUX - so no constants with big indices.
-                    if (instruction[1] < 0x10000)
-                    {
-                        TValue* k = &p->k[instruction[1]];
-                        TString* s = tsvalue(k);
-
-                        luaS_updateatom(L, s);
-
-                        if (s->atom >= 0)
-                            *instruction = (*instruction & 0xffffff00) | targetOp;
-                    }
-                }
-
-                instruction += Luau::getOpLength(LuauOpcode(LUAU_INSN_OP(*instruction)));
+            case LOP_NAMECALL:
+                targetOp = LOP_NAMECALLUDATA;
+                break;
             }
+
+            if (targetOp != -1)
+            {
+                LUAU_ASSERT(instruction[1] < uint32_t(sizek));
+
+                // We take over the upper 16 bits of AUX - so no constants with big indices.
+                if (instruction[1] < 0x10000)
+                {
+                    TValue* k = &p->k[instruction[1]];
+                    TString* s = tsvalue(k);
+
+                    luaS_updateatom(L, s);
+
+                    if (s->atom >= 0)
+                        *instruction = (*instruction & 0xffffff00) | targetOp;
+                }
+            }
+
+            instruction += Luau::getOpLength(LuauOpcode(LUAU_INSN_OP(*instruction)));
         }
 
         const int sizep = readVarInt(data, size, offset);
@@ -747,12 +820,26 @@ static int loadsafe(
             for (uint32_t j = 0; j < p->feedbackvecsize; j++)
             {
                 uint8_t slottype = read<uint8_t>(data, size, offset);
-                LUAU_ASSERT(slottype == LFT_CALLTARGET);
+
                 FeedbackVectorSlot& slot = p->feedbackvec[j];
                 slot.kind = static_cast<FeedbackVectorSlotKind>(slottype);
-                slot.call_target.pc = readVarInt(data, size, offset);
-                slot.call_target.proto = 0;
-                slot.call_target.hits = 0;
+
+                if (slottype == LFT_CALLTARGET)
+                {
+                    slot.call_target.pc = readVarInt(data, size, offset);
+                    slot.call_target.proto = 0;
+                    slot.call_target.hits = 0;
+                }
+                else if (slottype == LFT_CONSTRUCT)
+                {
+                    slot.construct.shape = readVarInt(data, size, offset);
+                    slot.construct.classid = 0;
+                    slot.construct.match = LCM_MISMATCH;
+                }
+                else
+                {
+                    LUAU_ASSERT(!"unknown feedback slot type");
+                }
             }
         }
 
@@ -764,7 +851,7 @@ static int loadsafe(
 
         if (version >= 12)
         {
-            // Potantially skipping unknown data at the end of Proto.
+            // Potentially skipping unknown data at the end of Proto.
             offset = protoStartOffset + protoSize;
         }
 
@@ -790,7 +877,7 @@ int luau_load(lua_State* L, const char* chunkname, const char* data, size_t size
     luaC_checkGC(L);
 
     // pause GC for the duration of deserialization - some objects we're creating aren't rooted
-    const ScopedSetGCThreshold pauseGC{L->global, SIZE_MAX};
+    const ScopedDisableGC pauseGC{L->global, SIZE_MAX};
 
     struct LoadContext
     {

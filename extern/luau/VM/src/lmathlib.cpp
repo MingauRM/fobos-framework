@@ -7,7 +7,6 @@
 #include <limits>
 #include <math.h>
 #include <time.h>
-#include <algorithm>
 
 #define LUAU_PI (3.14159265358979323846)
 #define RADIANS_PER_DEGREE (LUAU_PI / 180.0)
@@ -471,40 +470,6 @@ static int math_isfinite(lua_State* L)
     return 1;
 }
 
-static int math_smoothstep(lua_State* L)
-{
-    double start = luaL_checknumber(L, 1);
-    double end = luaL_checknumber(L, 2);
-    double x = luaL_checknumber(L, 3);
-
-    if (start == end)
-    {
-        lua_pushnumber(L, x >= start ? 1.0 : 0.0);
-        return 1;
-    }
-
-    double t = std::clamp((x - start) / (end - start), 0.0, 1.0);
-    lua_pushnumber(L, t * t * (3.0 - 2.0 * t));
-
-    return 1;
-}
-
-static int math_trunc(lua_State* L)
-{
-    double x = luaL_checknumber(L, 1);
-    lua_pushnumber(L, trunc(x));
-
-    return 1;
-}
-
-static int math_frac(lua_State* L)
-{
-    double x = luaL_checknumber(L, 1);
-    lua_pushnumber(L, x - trunc(x));
-
-    return 1;
-}
-
 static const luaL_Reg mathlib[] = {
     {"abs", math_abs},
     {"acos", math_acos},
@@ -543,9 +508,6 @@ static const luaL_Reg mathlib[] = {
     {"isnan", math_isnan},
     {"isinf", math_isinf},
     {"isfinite", math_isfinite},
-    {"smoothstep", math_smoothstep},
-    {"frac", math_frac},
-    {"trunc", math_trunc},
     {NULL, NULL},
 };
 

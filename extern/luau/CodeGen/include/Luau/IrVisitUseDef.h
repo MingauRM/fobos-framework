@@ -4,6 +4,8 @@
 #include "Luau/Common.h"
 #include "Luau/IrData.h"
 
+LUAU_FASTFLAG(LuauCodegenX64ConflictCheck)
+
 namespace Luau
 {
 namespace CodeGen
@@ -69,6 +71,7 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
         // A <- B
     case IrCmd::DO_LEN:
+    case IrCmd::CONSTRUCT:
         visitor.use(OP_B(inst));
 
         visitor.def(OP_A(inst));
@@ -87,6 +90,14 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
     case IrCmd::INTERRUPT:
         break;
+    case IrCmd::UPDATE_COUNTERS:
+    {
+        IrCounterSet& counterSet = function.counterSets[function.uintOp(OP_A(inst))];
+
+        for (const IrEntryCounter& counter : counterSet.counters)
+            visitor.use(counter.operand);
+        break;
+    }
     case IrCmd::BARRIER_OBJ:
     case IrCmd::BARRIER_TABLE_FORWARD:
         visitor.maybeUse(OP_B(inst));
@@ -151,6 +162,17 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         // While ADJUST_STACK_TO_REG would semantically define the result range, we need to define it immediately
         visitor.defRange(vmRegOp(OP_B(inst)), function.intOp(OP_G(inst)));
         break;
+
+    case IrCmd::INVOKE_FASTPCALL:
+    {
+        // For a call, 'result start' register is also the register where the target function is
+        // For fast protected calls, function is setup by the instruction itself
+        visitor.useRange(vmRegOp(OP_A(inst)) + 1, function.intOp(OP_C(inst)));
+
+        visitor.defRange(vmRegOp(OP_A(inst)), function.intOp(OP_D(inst)));
+        break;
+    }
+
     case IrCmd::FORGLOOP:
         // First register is not used by instruction, we check that it's still 'nil' with CHECK_TAG
         visitor.use(OP_A(inst), 1);
@@ -222,6 +244,33 @@ static void visitVmRegDefsUses(T& visitor, IrFunction& function, IrInst& inst)
         break;
     case IrCmd::MARK_DEAD:
         // Does not affect VM def/use info
+        break;
+
+        // These instructions read VmReg only after optimizeMemoryOperandsX64
+    case IrCmd::CHECK_TAG:
+    case IrCmd::FLOOR_NUM:
+    case IrCmd::CEIL_NUM:
+    case IrCmd::ROUND_NUM:
+    case IrCmd::SQRT_NUM:
+    case IrCmd::ABS_NUM:
+        if (FFlag::LuauCodegenX64ConflictCheck)
+            visitor.maybeUse(OP_A(inst));
+        break;
+    case IrCmd::CHECK_TRUTHY:
+    case IrCmd::ADD_NUM:
+    case IrCmd::SUB_NUM:
+    case IrCmd::MUL_NUM:
+    case IrCmd::DIV_NUM:
+    case IrCmd::IDIV_NUM:
+    case IrCmd::MOD_NUM:
+    case IrCmd::MIN_NUM:
+    case IrCmd::MAX_NUM:
+    case IrCmd::JUMP_CMP_NUM:
+        if (FFlag::LuauCodegenX64ConflictCheck)
+        {
+            visitor.maybeUse(OP_A(inst));
+            visitor.maybeUse(OP_B(inst));
+        }
         break;
 
     default:

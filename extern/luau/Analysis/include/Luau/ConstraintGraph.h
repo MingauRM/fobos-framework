@@ -3,7 +3,6 @@
 #pragma once
 
 #include "Luau/Constraint.h"
-#include "Luau/Set.h"
 #include "Luau/ToString.h"
 #include "Luau/Type.h"
 
@@ -58,16 +57,20 @@ struct ConstraintList
         size_t index;
 
         void advanceUntilPresentOrEnd();
-
     };
 
     Iterator begin();
     Iterator end();
 
 private:
+    // Clip with LuauTraverseScopeToFunction
+    DenseHashMap<ConstraintVertex, bool, HashBlockedConstraintId> present_DEPRECATED;
+    // Clip with LuauTraverseScopeToFunction
+    std::vector<ConstraintVertex> order_DEPRECATED;
 
-    DenseHashMap<ConstraintVertex, bool, HashBlockedConstraintId> present{(TypeId) nullptr};
-    std::vector<ConstraintVertex> order;
+    DenseHashMap<ConstraintVertex, size_t, HashBlockedConstraintId> indices;
+    std::vector<std::pair<ConstraintVertex, bool>> order;
+
     size_t entries = 0;
 };
 
@@ -98,10 +101,21 @@ struct ConstraintGraph
 
     ConstraintGraph(NotNull<BuiltinTypes> builtinTypes);
 
+    // Constraint data co-located with the dependency edges that reference them.
+    // In the SCC path, multiple ConstraintGenerators accumulate directly into these fields.
+    // Constraints that go straight to the solver.
+    std::vector<ConstraintPtr> constraints;
+
+    // The set of all free types introduced during constraint generation.
+    TypeIds freeTypes;
+
+    // Map a function's signature scope back to its signature type.
+    DenseHashMap<Scope*, TypeId> scopeToFunction;
+
     /**
      * Add [dependency] as a blocker for [target]
      *
-     * Returns whether this is a fresh relationship (were we already tracking 
+     * Returns whether this is a fresh relationship (were we already tracking
      * it).
      */
     bool addDependencyOf(ConstraintVertex dependency, ConstraintVertex target);
@@ -136,7 +150,7 @@ struct ConstraintGraph
     /**
      * Unblock type [vertex].
      * 1. If [vertex] is now a bound type, walk the chain of bound types and
-     *    repair references to said type in the graph (see: `repairTypeReferneces`).
+     *    repair references to said type in the graph (see: `repairTypeReferences`).
      * 2. After references have been repaired, walk the reverse dependencies of
      *    [vertex] and remove [vertex] from each dependency list, and then clear
      *    the reverse dependency list of [vertex].
@@ -146,7 +160,7 @@ struct ConstraintGraph
     /**
      * Unblock type *pack* [vertex].
      * 1. If [vertex] is now a bound type, walk the chain of bound types and
-     *    repair references to said type in the graph (see: `repairTypeReferneces`).
+     *    repair references to said type in the graph (see: `repairTypeReferences`).
      * 2. After references have been repaired, walk the reverse dependencies of
      *    [vertex] and remove [vertex] from each dependency list, and then clear
      *    the reverse dependency list of [vertex].
@@ -155,17 +169,8 @@ struct ConstraintGraph
 
     /**
      * Return whether the vertex has any unsolved dependencies.
-     * 
-     * HACK: For `PrimitiveTypeConstraint` we consider it unblocked if there is
-     * a single dependency.
      */
     bool hasUnsolvedDependencies(ConstraintVertex vertex);
-
-    /**
-     * HACK: Used for `PrimitiveTypeConstraint` to check whether the free type
-     * it "controls" has other outstanding dependencies.
-     */
-    bool DEPRECATED_hasStrictlyMoreThanOneDependency(ConstraintVertex vertex);
 
     /**
      * Find all of the reference counted types that are reachable from `target`
@@ -177,7 +182,7 @@ struct ConstraintGraph
 
     /**
      * NOTE: You probably do not want to call this function directly.
-     * 
+     *
      * This attempts to find all the reachable mutable types from [target] and
      * shift all references from the type [source] to [target]. You probably
      * intend to use [copyDependenciesOf], the non-destructive version.
@@ -192,7 +197,6 @@ struct ConstraintGraph
     void dumpBlocked(NotNull<const Constraint> c, ToStringOptions& opts);
 
 private:
-
     NotNull<BuiltinTypes> builtinTypes;
 
     /**
@@ -238,17 +242,17 @@ private:
      * - Any free type pack with no dependencies can be generalized;
      * - Any constraint with no dependencies can be dispatched.
      */
-    ConstraintMap dependencies{(TypeId)nullptr};
-
-
-    NotNull<ConstraintList> findDependencyList(ConstraintVertex vertex);
+    ConstraintMap dependencies;
+    ConstraintList* findDependencyList(ConstraintVertex vertex);
+    NotNull<ConstraintList> findOrMakeDependencyList(ConstraintVertex vertex);
 
     /**
      * Inverse of the above mapping. Yes, the proper name for this is
      * "dependents," but naming it such will result in hellish typos.
      */
-    ConstraintMap reverseDependencies{(TypeId)nullptr};
-    NotNull<ConstraintList> findReverseDependencyList(ConstraintVertex vertex);
+    ConstraintMap reverseDependencies;
+    ConstraintList* findReverseDependencyList(ConstraintVertex vertex);
+    NotNull<ConstraintList> findOrMakeReverseDependencyList(ConstraintVertex vertex);
 
     /**
      * We do the same pseudo-arena trick as constraints do right now.
@@ -257,9 +261,8 @@ private:
 
     [[maybe_unused]]
     void dump();
-
 };
 
 std::string dump(ConstraintVertex vertex);
 
-}
+} // namespace Luau
